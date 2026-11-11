@@ -110,4 +110,21 @@ LCEL 구조화 출력, RAG, 트레이스, 평가(RAGAS, LLM-as-Judge)는 반드�
 
 ## 실행 명령어
 
-(구현하면서 채운다)
+모든 명령은 프로젝트 폴더(`mini-pjt`)에서 실행한다.
+
+```
+# 라이브러리 설치
+.venv\Scripts\python -m pip install -r requirements.txt
+
+# 질문 하나를 바로 실행해 JSON 출력 (서버 없이)
+.venv\Scripts\python -m src.agent "정자동에 중2 수학 내신대비반 있는 학원 알려줘"
+
+# API 서버 실행 (http://127.0.0.1:8000, 문서: /docs)
+.venv\Scripts\uvicorn src.api:app --port 8000
+
+# 서버에 질문 보내기 (PowerShell)
+Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes('{"question": "중1 영어 기초부터 잡아주는 학원 있어?"}')) | ConvertTo-Json -Depth 5
+```
+
+- 학원 소개 문서를 고쳤으면 `chroma_db` 폴더를 지우고 다시 실행한다 (처음 실행할 때 새로 만든다).
+- LangSmith 추적은 `.env`의 `LANGSMITH_TRACING=true`면 자동으로 켜진다.

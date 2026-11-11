@@ -12,3 +12,11 @@ langchain-text-splitters
 # 1단계: API 서버
 fastapi
 uvicorn
+
+# 2단계: 평가 (RAGAS)
+ragas
+# ragas 0.4는 langchain-community 0.4.2에서 빠진 모듈을 불러와서 0.4.1로 고정
+langchain-community==0.4.1
+# ragas가 요구하지만 우리는 쓰지 않는 패키지. 최신판은 Python 3.14용 설치 파일이 없어 빌드에 실패하므로
+# 빌드가 필요 없는 0.12.1로 고정
+scikit-network==0.12.1
