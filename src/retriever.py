@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -22,7 +23,8 @@ CHROMA_DIR = ROOT / "chroma_db"
 COLLECTION = "academy_docs"
 
 EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"  # Day 2·6 실습과 같은 임베딩
-REGION = "us-east-1"
+# .env의 BEDROCK_REGION을 씁니다. 없으면 기본값. (.env는 src.agent가 먼저 읽습니다)
+REGION = os.getenv("BEDROCK_REGION", "us-east-1")
 TOP_K = 8  # 질문 하나에 가져올 조각 수 (10곳 x 5섹션 = 50조각 중)
 
 

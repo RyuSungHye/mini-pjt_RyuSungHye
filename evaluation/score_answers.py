@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -33,9 +34,12 @@ EVAL_DIR = Path(__file__).resolve().parent
 ROOT = EVAL_DIR.parent
 QUERIES = EVAL_DIR / "test_queries.csv"
 
-JUDGE_MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+# .env의 JUDGE_MODEL_ID를 씁니다. 없으면 기본값.
+# (.env는 위의 evaluation.generate_answers -> src.agent import 때 이미 읽힙니다)
+JUDGE_MODEL_ID = os.getenv("JUDGE_MODEL_ID", "global.anthropic.claude-haiku-4-5-20251001-v1:0")
 EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
-REGION = "us-east-1"
+# .env의 BEDROCK_REGION을 씁니다. 없으면 기본값.
+REGION = os.getenv("BEDROCK_REGION", "us-east-1")
 RAGAS_CATEGORIES = ("positive", "edge")
 
 load_dotenv(ROOT / ".env")

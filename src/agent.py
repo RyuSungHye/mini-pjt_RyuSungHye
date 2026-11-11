@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -186,8 +187,10 @@ def mask_pii(text: str) -> str:
 #   retrieve : 학원 소개 문서에서 질문과 가까운 조각을 찾는다 (src/retriever.py)
 #   generate : 찾은 조각만 근거로 답한다. LCEL 구조화 출력으로 답변 + 근거 조각 id를 받는다
 
-MODEL_ID = "global.anthropic.claude-sonnet-4-6"
-REGION = "us-east-1"
+# .env의 AGENT_MODEL_ID를 씁니다. 없으면 기본값.
+MODEL_ID = os.getenv("AGENT_MODEL_ID", "global.anthropic.claude-sonnet-4-6")
+# .env의 BEDROCK_REGION을 씁니다. 없으면 기본값.
+REGION = os.getenv("BEDROCK_REGION", "us-east-1")
 
 SYSTEM_PROMPT = """당신은 성남시 분당구 중학생 학부모를 돕는 "분당구 학원 찾기 도우미"입니다.
 아래 [학원 소개 자료]에 있는 내용만 근거로 한국어로 답합니다.
