@@ -1,0 +1,14 @@
+# agent.py 실행
+langchain-core
+langgraph
+langchain-aws
+boto3
+python-dotenv
+
+# 1단계: RAG (Day 2·6과 같은 방식)
+langchain-chroma
+langchain-text-splitters
+
+# 1단계: API 서버
+fastapi
+uvicorn
