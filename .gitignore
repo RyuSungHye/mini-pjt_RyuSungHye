@@ -1,0 +1,14 @@
+# 비밀 키
+.env
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 과제 규약과 맞지 않는 Ouroboros seed
+seeds/
