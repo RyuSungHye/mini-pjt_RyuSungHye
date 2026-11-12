@@ -33,10 +33,10 @@
 |---|---|---|
 | LCEL 구조화 출력 | 답변 생성 `prompt \| llm.with_structured_output(RagAnswer)` (답변 + 근거로 쓴 doc_id), Judge 채점 `JudgeResult` | Day 1 |
 | RAG·검색 품질 개선 | 학원 소개 문서를 섹션 단위 50조각으로 Chroma에 저장(Titan 임베딩). 2차에서 학원 단위 확장 + 동·과목 메타데이터 필터로 개선 | Day 2 |
-| LangGraph 상태·조건부 분기 | `RagState`를 노드끼리 넘기는 상태 그래프. `input_guard`에서 차단이면 바로 END, 아니면 `tool_call`로 가는 조건부 엣지 | Day 3 |
-| 도구 자율 선택 | `tool_call` 노드에서 모델이 `bind_tools`로 `search_academies` 호출 여부와 인자(동, 과목)를 스스로 정함. 단, 반복 루프(ReAct)가 아니라 한 번만 판단한다 | Day 3 |
-| 도구 정의 | `@tool search_academies(dong, subject)` — 공공데이터 CSV를 분당구·개원·중학생·과목 규칙으로 필터 | Day 4 |
-| 가드레일 | 입력: 프롬프트 인젝션 차단 / 출력: 광고성 문장 제거·학원 이름 근거 확인·두 묶음 표시 확인 | Day 5 (`guarded_agent.py` 기반) |
+| LangGraph 상태·조건부 분기 | `RagState`를 노드끼리 넘기는 상태 그래프. 조건부 엣지 2개: `input_guard`에서 차단이면 END, 아니면 `scope_guard` / `scope_guard`에서 수학·영어 외 과목만 물었으면 END(범위 안내), 아니면 `tool_call` | Day 3 |
+| 도구 자율 선택 | `tool_call` 노드에서 모델이 `bind_tools`로 `search_academies` 호출 여부와 인자(동, 과목, 정렬 `sort`, 수강료 상한·하한 `max_fee`·`min_fee`)를 정함. 반복 루프(ReAct)가 아니라 한 번만 판단한다. 모델이 부르지 않았는데 질문에 동과 과목이 함께 있으면 코드 규칙으로 호출한다 (trace에 "호출 근거" 기록) | Day 3 |
+| 도구 정의 | `@tool search_academies(dong, subject, sort, max_fee, min_fee)` — 공공데이터 CSV를 분당구·개원·중학생·과목 규칙으로 필터. 학원별 중등 최저 수강료(과정명에 "특강"이 있으면 제외)를 코드로 계산해 수강료 조건 거르기·정렬을 전체에 적용한 뒤 15곳을 넘긴다. 수강료 정보 없는 학원은 따로 표시하고, 최저 수강료 10만 원 미만이면 주의 문구를 붙인다 | Day 4 |
+| 가드레일 | 입력: 프롬프트 인젝션 차단(`input_guard`), 과목 범위 판단(`scope_guard`, 코드로 판단) / 출력(`output_guard`): 광고성 문장 제거·학원 이름 근거 확인(1~2글자만 다른 원본 이름이 하나뿐이면 고침)·두 묶음 표시 확인·10만 원 미만 주의 문구가 빠졌으면 덧붙임·범위 밖 과목 안내 한 줄 | Day 5 (`guarded_agent.py` 기반) |
 | 미들웨어(마스킹) | 그래프 앞(`api.py`)에서 이름·학교·전화번호를 가리고, 답변을 내보내기 전에 다시 가림. LangChain 미들웨어 API가 아니라 API 경계와 그래프 노드로 구현 | Day 5 |
 | 트레이스(LangSmith) | 응답의 `trace`에 단계별 입력·출력 기록 + LangSmith 추적 | Day 7 |
 | 평가 | 평가 질문 세트 `test_queries.csv` 15문항 + LLM-as-Judge (expected_traits / forbidden) + RAGAS 4개 지표 | Day 2·7 |
@@ -126,9 +126,11 @@ LANGSMITH_PROJECT=...
 Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes('{"question": "중1 영어 기초부터 잡아주는 학원 있어?"}')) | ConvertTo-Json -Depth 5
 
 # 6) 평가 (답변 생성 → 채점). 저장된 답변·판정은 건너뛰므로 멈춰도 이어서 실행된다
-.venv\Scripts\python -m evaluation.generate_answers --round round2
-.venv\Scripts\python -m evaluation.score_answers --round round2
+.venv\Scripts\python -m evaluation.generate_answers --round round3
+.venv\Scripts\python -m evaluation.score_answers --round round3
 ```
+
+- round1·round2도 같은 명령에서 `--round` 값만 바꿔 실행했다 (결과: `evaluation/{round}_answers.json`, `evaluation/{round}_scores.json`).
 
 - 처음 실행할 때 `chroma_db/`가 자동으로 만들어진다. 학원 소개 문서를 고쳤으면 이 폴더를 지우고 다시 실행한다.
 - Bedrock에서 `ThrottlingException`(한도 초과)이 나면 재시도하지 않고 멈춘다. 같은 명령으로 이어서 실행한다.
@@ -175,6 +177,17 @@ positive·edge 9문항(1~6, 10~12) 기준. negative·guardrail은 reference가 "
 | 13 | 개인정보가 들어간 질문 | 가드레일(이름·전화번호·학교 마스킹, 성적 반복 안 함) + ① 확장으로 다온길·모래시계 반 정보 포함 |
 
 - 남은 실패: **4번** (평일 저녁 7시 이후 영어) — 2·3차 모두. 아래 한계 참고.
+
+### 3차 평가 이후 수정
+
+3차 평가 뒤에 답변 문구만 바꾸는 수정을 했다. 검색·도구·가드레일의 동작(어떤 학원을 어떤 순서로 넘기는지)은 그대로라 **평가는 다시 돌리지 않았고**, 위 3차 수치는 수정 전 코드 기준이다. 대신 탐색 1번("정자동 영어 학원 중에 월 30만 원 이하인 곳 있어?")을 다시 실행해 확인했다.
+
+| 수정 | 내용 | 확인 (탐색 1번 재실행) |
+|---|---|---|
+| 자료 이름표 문구 | 모델에 넘기는 "[가상 학원 교습비 정리]"를 "학원 소개 자료의 반별 월 교습비 (월 교습비 낮은 순)"로 바꿈. 3차 직후 탐색 1번 답변에 이 이름표가 그대로 나왔기 때문 | 답변에 대괄호 이름표 없음 |
+| 정보 없음 문구 | "정렬·거르기 대상 아님" 같은 내부 표현을 빼고 "수강료 정보가 없는 학원 (맨 뒤에 따로 표시)", "교습비 정보 없음 (학원에 문의 필요)"로 바꿈 | — (이 질문에는 정보 없음 학원이 없음) |
+| "11곳 중 6곳" 머리말 | 수강료 조건 결과 머리말을 "수강료 정보가 없는 N곳을 빼고, 조건에 맞는 학원이 M곳"으로 고침. 전에는 모델이 "11곳 중 수강료 정보가 확인된 6곳"으로 잘못 옮겼다 (실제로는 11곳 모두 정보가 있고 조건에 맞는 곳이 6곳) | "11곳 중 월 30만 원 이하 중등 과정이 있는 학원은 6곳"으로 맞게 나옴, 실제 6곳 모두 제시 |
+| 금지 표현 목록 | 답변 프롬프트에 "받은 자료의 이름표를 옮겨 적지 않는다"를 추가 ("[학원 소개 자료 (가상)]", "[doc_id: ...]", "[1번째]", "[가상 학원 교습비 정리]", "조회 조건: 동=..." 등) | 대괄호 이름표·"조회 조건:" 머리말 없음 |
 - 평가 세트 외 탐색 테스트 10건(`run_query` 8건 + 시연 화면 2건)을 별도로 실행했고, 개선 A~D 뒤에 1~10번과 새 질문 11번을 다시 실행했다. 개선 전 문제 6건 중 3건(수강료 필터·국어 범위·수강료 정렬)이 정상이 됐다. 결과: [evaluation/exploratory_tests.md](evaluation/exploratory_tests.md)
 
 ---
@@ -226,16 +239,16 @@ positive·edge 9문항(1~6, 10~12) 기준. negative·guardrail은 reference가 "
 
 | 기능 | 위치 |
 |---|---|
-| 그래프 구성 (노드·엣지) | [src/agent.py:609](src/agent.py#L609) `build_rag_graph()`, 연결은 [src/agent.py:836](src/agent.py#L836) |
+| 그래프 구성 (노드·엣지) | [src/agent.py:618](src/agent.py#L618) `build_rag_graph()`, 연결은 [src/agent.py:845](src/agent.py#L845) |
 | 입력 가드 (인젝션 차단) | [src/agent.py:126](src/agent.py#L126) `input_guard()` |
 | 개인정보 마스킹 | [src/agent.py:185](src/agent.py#L185) `mask_pii_report()` |
-| 과목 범위 가드 (A) | [src/agent.py:669](src/agent.py#L669) `scope_guard_node`, [src/agent.py:426](src/agent.py#L426) `detect_subjects()`, [src/agent.py:451](src/agent.py#L451) `strip_out_of_scope()` |
-| 출력 가드 (광고 문장·학원 이름 확인·고치기) | [src/agent.py:779](src/agent.py#L779) `output_guard_node`, [src/agent.py:226](src/agent.py#L226) `remove_ad_sentences()`, [src/agent.py:246](src/agent.py#L246) `check_academy_names()`, [src/agent.py:287](src/agent.py#L287) `fix_academy_names()` (D) |
-| 시스템 프롬프트 (두 묶음 규칙) | [src/agent.py:334](src/agent.py#L334) `SYSTEM_PROMPT` |
-| 도구 호출 판단 (C) | [src/agent.py:380](src/agent.py#L380) `TOOL_SYSTEM_PROMPT`, [src/agent.py:708](src/agent.py#L708) `tool_call_node` |
-| 동·과목 조건 추출 | [src/agent.py:403](src/agent.py#L403) `extract_conditions()` |
-| 가상 학원 교습비 정리 (B) | [src/agent.py:549](src/agent.py#L549) `virtual_fee_summary()` |
-| 실행 진입점 | [src/agent.py:857](src/agent.py#L857) `run_query()` |
+| 과목 범위 가드 (A) | [src/agent.py:678](src/agent.py#L678) `scope_guard_node`, [src/agent.py:435](src/agent.py#L435) `detect_subjects()`, [src/agent.py:460](src/agent.py#L460) `strip_out_of_scope()` |
+| 출력 가드 (광고 문장·학원 이름 확인·고치기) | [src/agent.py:788](src/agent.py#L788) `output_guard_node`, [src/agent.py:226](src/agent.py#L226) `remove_ad_sentences()`, [src/agent.py:246](src/agent.py#L246) `check_academy_names()`, [src/agent.py:287](src/agent.py#L287) `fix_academy_names()` (D) |
+| 시스템 프롬프트 (두 묶음 규칙) | [src/agent.py:343](src/agent.py#L343) `SYSTEM_PROMPT` |
+| 도구 호출 판단 (C) | [src/agent.py:389](src/agent.py#L389) `TOOL_SYSTEM_PROMPT`, [src/agent.py:717](src/agent.py#L717) `tool_call_node` |
+| 동·과목 조건 추출 | [src/agent.py:412](src/agent.py#L412) `extract_conditions()` |
+| 가상 학원 교습비 정리 (B) | [src/agent.py:558](src/agent.py#L558) `virtual_fee_summary()` |
+| 실행 진입점 | [src/agent.py:866](src/agent.py#L866) `run_query()` |
 | 공공데이터 검색 도구 (정렬·수강료 조건 B) | [src/tools.py:130](src/tools.py#L130) `search_academies_data()`, [src/tools.py:228](src/tools.py#L228) `search_academies` |
 | RAG 검색 (확장 + 필터) | [src/retriever.py:136](src/retriever.py#L136) `retrieve_academies()`, [src/retriever.py:122](src/retriever.py#L122) `build_filter()` |
 | API (경계 마스킹) | [src/api.py:56](src/api.py#L56) `query()` |

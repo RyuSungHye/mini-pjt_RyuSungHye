@@ -312,16 +312,25 @@ def fix_academy_names(answer: str, ungrounded: list[str], contexts: list[dict]) 
 #                        |
 #                       통과
 #                        v
+#                   scope_guard --수학·영어 외 과목만--> 범위 안내 -> END
+#                        |
+#                  범위 안 (섞이면 범위 밖 과목 낱말을 빼고 진행)
+#                        v
 #                    tool_call -> retrieve -> generate -> output_guard -> END
 #
 #   mask         : 이름·전화번호·학교 등을 가린다. 이후 노드는 가린 질문만 본다
 #   input_guard  : 프롬프트 인젝션을 막는다 (모델 호출 0회로 끝남)
-#   tool_call    : [실제] 모델이 필요하다고 판단하면 search_academies로 공공데이터를 조회한다 (src/tools.py)
+#   scope_guard  : 질문 속 과목을 코드로 판단한다 (모델 호출 0회). 범위 밖 과목만이면 범위 안내로 끝내고,
+#                  범위 안 과목과 섞이면 범위 밖 과목 낱말을 뺀 질문을 다음 노드에 넘긴다
+#   tool_call    : [실제] 모델이 search_academies 호출 여부와 인자(동·과목·정렬·수강료 조건)를 정한다 (src/tools.py)
+#                  모델이 부르지 않았는데 질문에 동과 과목이 함께 있으면 코드 규칙으로 호출한다
 #                  여기서 정한 동·과목 조건을 retrieve가 재활용한다
 #   retrieve     : [가상] 학원 소개 문서 검색 (src/retriever.py)
 #                  ② 동·과목 필터 -> 가까운 조각 -> ① 학원 단위 확장 (반 구성까지 함께)
 #   generate     : 두 자료를 따로 받아 답한다. LCEL 구조화 출력으로 답변 + 근거 id를 받는다
-#   output_guard : 단정 추천 문장 제거, 학원 이름 근거 확인, 가상/실제 묶음 표시 확인, 답변 개인정보 재확인
+#                  수강료 질문이면 가상 학원 반별 교습비를 코드로 정리해 함께 넘긴다
+#   output_guard : 단정 추천 문장 제거, 학원 이름 근거 확인(1~2글자 오타는 원본 이름 하나뿐일 때 고침),
+#                  가상/실제 묶음 표시 확인, 10만 원 미만 수강료 주의, 범위 밖 과목 안내 한 줄, 답변 개인정보 재확인
 #
 #   가상 학원과 실제 학원은 섞지 않는다 (SERVICE.md 정책 2).
 #   contexts의 doc_id는 virtual:... / public:... 으로 출처를 구분한다.
