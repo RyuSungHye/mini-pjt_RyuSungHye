@@ -294,6 +294,7 @@ SYSTEM_PROMPT = """당신은 성남시 분당구 중학생 학부모를 돕는 "
 - 학원 정보를 말할 때는 문장 끝에 "(출처: 학원 소개 자료)"를 붙입니다.
 - "최고", "무조건" 같은 단정적 추천을 하지 않고 조건별로 비교해 제시합니다.
 - 질문의 [이름], [전화번호], [학교] 같은 표시는 개인정보를 가린 것입니다. 답변에 원래 값을 추측해 쓰지 않습니다.
+- 질문에 나온 성적(점수)은 맞는 반 수준(기초·내신대비·선행 등)을 고르는 데만 쓰고, 답변에 점수를 그대로 쓰지 않습니다.
 - used_doc_ids에는 답변에 실제로 쓴 조각의 doc_id만 넣습니다."""
 
 HUMAN_PROMPT = """[학원 소개 자료]
@@ -328,6 +329,7 @@ def build_rag_graph():
 
     class RagState(TypedDict, total=False):
         question: str          # mask 노드 이후에는 가린 질문으로 바뀝니다
+        mask_counts: dict      # 그래프 밖(api.py)에서 미리 가린 항목 수. trace 기록용
         blocked: bool
         docs: list
         answer: str
@@ -342,7 +344,10 @@ def build_rag_graph():
 
     # ── 입력 가드레일 1: 마스킹 ─────────────────────────────
     def mask_node(state: RagState) -> dict:
+        # api.py가 이미 가렸다면 여기서는 남은 것만 가립니다. 기록은 두 번의 결과를 합쳐서 남깁니다.
         masked, counts = mask_pii_report(state["question"])
+        for k, v in (state.get("mask_counts") or {}).items():
+            counts[k] = counts.get(k, 0) + v
         detail = ", ".join(f"{k} {v}개" for k, v in counts.items()) if counts else "가릴 개인정보 없음"
         step = {
             "step": "mask",
@@ -438,13 +443,16 @@ def build_rag_graph():
 _graph = None
 
 
-def run_query(question: str) -> dict:
-    """질문 하나를 처리해 API 스펙 모양(answer, contexts, trace)으로 돌려줍니다."""
+def run_query(question: str, mask_counts: dict | None = None) -> dict:
+    """질문 하나를 처리해 API 스펙 모양(answer, contexts, trace)으로 돌려줍니다.
+
+    mask_counts: 호출하는 쪽(api.py)에서 미리 가렸을 때 그 결과. trace의 mask 기록에 합쳐집니다.
+    """
     global _graph
     if _graph is None:
         _graph = build_rag_graph()
 
-    state = _graph.invoke({"question": question, "trace": []})
+    state = _graph.invoke({"question": question, "mask_counts": mask_counts or {}, "trace": []})
     return {"answer": state["answer"], "contexts": state.get("contexts", []), "trace": state["trace"]}
 
 

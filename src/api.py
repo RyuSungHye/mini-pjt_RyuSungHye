@@ -7,7 +7,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from src.agent import run_query
+from src.agent import mask_pii_report, run_query
 
 
 class QueryRequest(BaseModel):
@@ -36,4 +36,6 @@ app = FastAPI(title="분당구 학원 찾기 도우미")
 
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest) -> dict:
-    return run_query(req.question)
+    # 그래프를 부르기 전에 가립니다. 그래프 입력이 LangSmith에 기록되므로, 여기서 가려야 원문이 남지 않습니다.
+    masked, counts = mask_pii_report(req.question)
+    return run_query(masked, mask_counts=counts)
