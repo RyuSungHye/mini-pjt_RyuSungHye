@@ -270,6 +270,40 @@ def check_academy_names(answer: str, contexts: list[dict], pool: list[dict]) -> 
     return {"names": names, "ok": ok, "added": added, "ungrounded": ungrounded}
 
 
+CONTEXT_NAME = re.compile(r"학원명: ([^|\n]+?)\s*(?:\||\n|$)")
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """두 글자열이 몇 글자 다른지 (글자 바꾸기·넣기·빼기 횟수)."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def fix_academy_names(answer: str, ungrounded: list[str], contexts: list[dict]) -> tuple[str, list[str], list[str]]:
+    """원본에 없는 학원 이름을 고칩니다.
+
+    contexts의 학원 이름 중 한두 글자만 다른 이름이 딱 하나 있을 때만 그 이름으로 바꿉니다.
+    후보가 없거나 여러 개면 고치지 않고 남깁니다 (경고 대상).
+    돌려주는 값: (고친 답변, 바꾼 기록 ["틀린 이름 → 원본 이름"], 여전히 근거 없는 이름)
+    """
+    ctx_names = list(dict.fromkeys(m.strip() for c in contexts for m in CONTEXT_NAME.findall(c["text"])))
+    fixed, still = [], []
+    for name in ungrounded:
+        key = _name_key(name)
+        cands = [n for n in ctx_names if 0 < _edit_distance(key, _name_key(n)) <= 2]
+        if len(cands) == 1:
+            answer = answer.replace(name, cands[0])
+            fixed.append(f"{name} → {cands[0]}")
+        else:
+            still.append(name)
+    return answer, fixed, still
+
+
 # ══════════════════════════════════════════════════════════════════
 # 4부. 학원 RAG 그래프 (가드레일 연결)
 # ══════════════════════════════════════════════════════════════════
@@ -312,6 +346,7 @@ SYSTEM_PROMPT = """당신은 성남시 분당구 중학생 학부모를 돕는 "
 - [가상 학원 교습비 정리]가 있으면 가상 묶음의 교습비 비교는 그 순서와 값을 그대로 씁니다.
 - "수강료 정보 없음" 학원은 정렬·거르기 결과 뒤에 따로 적습니다.
 - 공공데이터 학원에 "주의"가 붙어 있으면 그 학원 옆에 주의 문구를 그대로 적습니다. 그 학원을 빼거나 순서를 바꾸지 않습니다.
+- 학원 이름은 받은 글자 그대로 적습니다. 맞춤법이나 외래어 표기를 고치지 않습니다 (예: "잉글리시"를 "잉글리쉬"로 바꾸지 않음).
 - 한 학원 안의 수강료 과정 목록은 받은 순서 그대로 적습니다. 과정을 금액순 등으로 바꿔 적지 않습니다.
 - 최저 수강료와 수강료 조건 판단에는 특강 과정이 빠져 있습니다. 특강 과정도 목록에는 그대로 적습니다.
 - 답변에 "코드 계산", "도구", "contexts", "doc_id" 같은 내부 표현을 쓰지 않습니다. 학부모가 읽는 말로만 씁니다.
@@ -751,6 +786,10 @@ def build_rag_graph():
 
         # 2) 학원 이름이 근거에 있는지 확인 (SERVICE.md 정책 1)
         names = check_academy_names(answer, contexts, pool)
+        # 2-1) 한두 글자만 틀린 이름(맞춤법·외래어 표기)은 contexts의 원본 이름 하나로만 고침
+        name_fixes = []
+        if names["ungrounded"]:
+            answer, name_fixes, names["ungrounded"] = fix_academy_names(answer, names["ungrounded"], contexts)
         if names["ungrounded"]:
             answer += ("\n\n※ 다음 학원은 검색된 자료에서 확인되지 않았습니다: "
                        + ", ".join(names["ungrounded"]) + ". 학원에 직접 확인해 주세요.")
@@ -779,6 +818,7 @@ def build_rag_graph():
             f"단정 추천 문장 제거 {len(removed)}개" + (f": {removed}" if removed else ""),
             f"학원 이름 {len(names['names'])}개 확인 (contexts에 있음 {len(names['ok'])}"
             + (f", 받은 근거에서 보강 {names['added']}" if names["added"] else "")
+            + (f", 이름 고침 {name_fixes}" if name_fixes else "")
             + (f", 근거 없음 {names['ungrounded']}" if names["ungrounded"] else "")
             + ")",
             bundle,
