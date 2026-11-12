@@ -395,6 +395,19 @@ def scope_message(outside: list[str], question: str) -> str:
             f"- {dong} 중학생 영어 학원 교습비 비교해줘")
 
 
+_JOINER = r"(?:이랑|랑|하고|이나|와|과|및|,)?"  # 과목 앞뒤 연결 낱말 (수학이랑 과학, 국어와 수학)
+
+
+def strip_out_of_scope(question: str, outside: list[str]) -> str:
+    """질문에서 범위 밖 과목 낱말을 연결 낱말과 함께 뺍니다. 검색·답변 모델이 그 과목을 보지 않게 합니다.
+    예: "정자동 수학이랑 과학 학원 알려줘" -> "정자동 수학 학원 알려줘"
+    """
+    q = question
+    for s in sorted(outside, key=len, reverse=True):  # 생명과학을 과학보다 먼저 뺍니다
+        q = re.sub(_JOINER + r"\s*" + OUT_OF_SCOPE_PATTERNS[s] + _JOINER, " ", q)
+    return re.sub(r"\s{2,}", " ", q).strip()
+
+
 def scope_note(outside: list[str]) -> str:
     """범위 안 과목과 섞여 있을 때 답변 끝에 덧붙이는 안내."""
     return (f"\n\n---\n\n> {'·'.join(outside)} 학원은 안내하지 않습니다. "
@@ -504,17 +517,22 @@ def build_rag_graph():
 
     # ── 입력 가드레일 3: 과목 범위 (검색 전에 코드로 판단) ────────
     def scope_guard_node(state: RagState) -> dict:
-        inside, outside = detect_subjects(state["question"])
+        original = state["question"]
+        inside, outside = detect_subjects(original)
         out_only = bool(outside) and not inside
+        update = {"out_of_scope": out_only, "outside_subjects": outside}
         if out_only:
             result = f"범위 밖 과목만 질문 ({'·'.join(outside)}) -> 범위 안내로 답변, 검색·답변 모델 호출 안 함"
         elif outside:
-            result = (f"범위 안 과목 {'·'.join(inside)}은 정상 처리, "
-                      f"범위 밖 과목 {'·'.join(outside)}은 답변 끝에 안내만 덧붙임")
+            # 섞인 질문: 범위 밖 과목 낱말을 빼고 넘겨서, 모델이 그 과목에 대해 스스로 안내를 쓰지 않게 합니다.
+            scoped = strip_out_of_scope(original, outside)
+            update["question"] = scoped
+            result = (f"범위 안 과목 {'·'.join(inside)}은 정상 처리, 범위 밖 과목 {'·'.join(outside)}은 "
+                      f"질문에서 빼고 답변 끝에 안내 한 줄만 덧붙임 / 모델에 넘긴 질문: {scoped}")
         else:
             result = f"통과 (과목: {'·'.join(inside) or '언급 없음'})"
-        step = {"step": "scope_guard", "input": state["question"], "output": result}
-        update = {"out_of_scope": out_only, "outside_subjects": outside, "trace": state["trace"] + [step]}
+        step = {"step": "scope_guard", "input": f"원래 질문: {original}", "output": result}
+        update["trace"] = state["trace"] + [step]
         if out_only:
             update.update({"answer": scope_message(outside, state["question"]), "contexts": [], "docs": []})
         return update
