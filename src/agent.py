@@ -214,7 +214,12 @@ NEGATION_WORDS = ["않", "없", "어렵", "못", "드리지"]
 
 # 답변 속 학원 이름 찾기: "숲속문장영어학원", "한결노트수학교습소"처럼 붙여 쓴 이름
 ACADEMY_NAME = re.compile(r"[가-힣A-Za-z0-9]{2,}(?:학원|교습소)")
-GENERIC_NAMES = {"수학학원", "영어학원", "보습학원", "입시학원", "어학원", "수학교습소", "영어교습소"}
+GENERIC_NAMES = {"수학학원", "영어학원", "보습학원", "입시학원", "어학원", "수학교습소", "영어교습소", "학원교습소"}
+
+
+def _name_key(text: str) -> str:
+    """이름 비교용: 괄호 안 글자와 기호를 뺍니다. '매쓰프레소(Mathpresso)수학교습소' -> '매쓰프레소수학교습소'"""
+    return re.sub(r"\([^)]*\)|[^가-힣A-Za-z0-9]", "", text)
 
 
 def remove_ad_sentences(answer: str) -> tuple[str, list[str]]:
@@ -237,25 +242,27 @@ def remove_ad_sentences(answer: str) -> tuple[str, list[str]]:
     return "\n".join(out_lines), removed
 
 
-def check_academy_names(answer: str, contexts: list[dict], retrieved_docs: list) -> dict:
+def check_academy_names(answer: str, contexts: list[dict], pool: list[dict]) -> dict:
     """답변 속 학원 이름이 contexts에 있는지 확인합니다.
 
-    - contexts에 있음        -> ok
-    - 검색된 조각에만 있음  -> 그 조각을 contexts에 보강 (모델이 근거 id를 빠뜨린 경우)
-    - 어디에도 없음         -> ungrounded (지어냈을 수 있음)
+    pool: 이번 질문에서 모델에게 준 근거 전체 (가상 문서 조각 + 공공데이터 결과)
+    - contexts에 있음   -> ok
+    - pool에만 있음     -> 그 근거를 contexts에 보강 (모델이 근거 id를 빠뜨린 경우)
+    - 어디에도 없음     -> ungrounded (지어냈을 수 있음)
     """
     names = [n for n in dict.fromkeys(ACADEMY_NAME.findall(answer)) if n not in GENERIC_NAMES]
-    ctx_text = "\n".join(c["text"] for c in contexts)
+    ctx_key = _name_key("\n".join(c["text"] for c in contexts))
     ok, added, ungrounded = [], [], []
     for name in names:
-        if name in ctx_text:
+        key = _name_key(name)
+        if key in ctx_key:
             ok.append(name)
             continue
-        extra = [d for d in retrieved_docs if name in d.page_content]
+        extra = [p for p in pool if key in _name_key(p["text"])]
         if extra:
-            for d in extra:
-                if all(c["doc_id"] != d.metadata["doc_id"] for c in contexts):
-                    contexts.append({"doc_id": d.metadata["doc_id"], "text": d.page_content})
+            for p in extra:
+                if all(c["doc_id"] != p["doc_id"] for c in contexts):
+                    contexts.append(p)
             added.append(name)
         else:
             ungrounded.append(name)
@@ -270,13 +277,17 @@ def check_academy_names(answer: str, contexts: list[dict], retrieved_docs: list)
 #                        |
 #                       통과
 #                        v
-#                    retrieve -> generate -> output_guard -> END
+#                    retrieve -> tool_call -> generate -> output_guard -> END
 #
 #   mask         : 이름·전화번호·학교 등을 가린다. 이후 노드는 가린 질문만 본다
 #   input_guard  : 프롬프트 인젝션을 막는다 (모델 호출 0회로 끝남)
-#   retrieve     : 학원 소개 문서에서 질문과 가까운 조각을 찾는다 (src/retriever.py)
-#   generate     : 찾은 조각만 근거로 답한다. LCEL 구조화 출력으로 답변 + 근거 조각 id를 받는다
-#   output_guard : 단정 추천 문장 제거, 학원 이름 근거 확인, 답변 개인정보 재확인
+#   retrieve     : [가상] 학원 소개 문서에서 질문과 가까운 조각을 찾는다 (src/retriever.py)
+#   tool_call    : [실제] 모델이 필요하다고 판단하면 search_academies로 공공데이터를 조회한다 (src/tools.py)
+#   generate     : 두 자료를 따로 받아 답한다. LCEL 구조화 출력으로 답변 + 근거 id를 받는다
+#   output_guard : 단정 추천 문장 제거, 학원 이름 근거 확인, 가상/실제 묶음 표시 확인, 답변 개인정보 재확인
+#
+#   가상 학원과 실제 학원은 섞지 않는다 (SERVICE.md 정책 2).
+#   contexts의 doc_id는 virtual:... / public:... 으로 출처를 구분한다.
 
 # .env의 AGENT_MODEL_ID를 씁니다. 없으면 기본값.
 MODEL_ID = os.getenv("AGENT_MODEL_ID", "global.anthropic.claude-sonnet-4-6")
@@ -284,24 +295,48 @@ MODEL_ID = os.getenv("AGENT_MODEL_ID", "global.anthropic.claude-sonnet-4-6")
 REGION = os.getenv("BEDROCK_REGION", "us-east-1")
 
 SYSTEM_PROMPT = """당신은 성남시 분당구 중학생 학부모를 돕는 "분당구 학원 찾기 도우미"입니다.
-아래 [학원 소개 자료]에 있는 내용만 근거로 한국어로 답합니다.
+아래 두 자료에 있는 내용만 근거로 한국어로 답합니다.
+- [학원 소개 자료 (가상)]: 직접 만든 가상 학원 소개 문서입니다. 실존 학원이 아닙니다. doc_id가 virtual:로 시작합니다.
+- [공공데이터 (실제)]: 나이스 학원교습소정보에서 조회한 실제 학원입니다. doc_id가 public:으로 시작합니다.
+
+가상 학원과 실제 학원을 섞지 않기 (가장 중요)
+- 학원 정보를 안내할 때는 "## 학원 소개 자료 (가상 학원)"과 "## 공공데이터 (실제 학원)" 두 묶음으로 나눠 씁니다.
+- 가상 학원 이름 뒤에는 "(가상)", 실제 학원 이름 뒤에는 "(실제)"를 붙입니다.
+- 두 묶음을 한 표나 한 순위로 합치지 않습니다. 교습비 비교도 같은 묶음 안에서만 합니다.
+- 한쪽 자료에 맞는 내용이 없으면 그 묶음에 "해당 자료 없음" 또는 "이번 질문에서는 조회하지 않음"이라고 짧게 씁니다.
+- 공공데이터 목록은 학원명 가나다순이며 순위가 아닙니다. 전체 개수가 더 많으면 일부만 보여 준다고 알립니다.
+- 공공데이터에는 반 이름·수업 시간·설명회 정보가 없습니다. 이런 정보는 "확인할 수 없음"으로 답합니다.
 
 규칙
 - 자료에 없는 학원, 반, 수업 시간, 교습비, 설명회 정보는 지어내지 않습니다.
 - 자료에서 확인할 수 없으면 "확인할 수 없음"이라고 말하고 학원에 직접 문의하도록 안내합니다.
 - 자료에 "정보 없음"으로 적힌 값은 그대로 "정보 없음"이라고 답합니다.
 - 질문의 조건(동, 학년, 과목, 반 유형, 시간)에 맞는 학원·반만 답합니다.
-- 학원 정보를 말할 때는 문장 끝에 "(출처: 학원 소개 자료)"를 붙입니다.
+- 가상 학원 정보 끝에는 "(출처: 학원 소개 자료·가상)", 실제 학원 정보 끝에는 "(출처: 공공데이터·실제)"를 붙입니다.
 - "최고", "무조건" 같은 단정적 추천을 하지 않고 조건별로 비교해 제시합니다.
 - 질문의 [이름], [전화번호], [학교] 같은 표시는 개인정보를 가린 것입니다. 답변에 원래 값을 추측해 쓰지 않습니다.
 - 질문에 나온 성적(점수)은 맞는 반 수준(기초·내신대비·선행 등)을 고르는 데만 쓰고, 답변에 점수를 그대로 쓰지 않습니다.
 - used_doc_ids에는 답변에 실제로 쓴 조각의 doc_id만 넣습니다."""
 
-HUMAN_PROMPT = """[학원 소개 자료]
-{context}
+HUMAN_PROMPT = """[학원 소개 자료 (가상)]
+{virtual_context}
+
+[공공데이터 (실제)]
+{public_context}
 
 [질문]
 {question}"""
+
+# 실제 학원 조회(search_academies)를 할지 정하는 모델의 지시문
+TOOL_SYSTEM_PROMPT = """당신은 분당구 학원 찾기 도우미의 도구 선택 담당입니다.
+질문을 보고 실제 학원(공공데이터) 조회가 필요하면 search_academies를 한 번 호출합니다.
+- 동(지역)이나 과목으로 학원 목록·교습비를 찾는 질문이면 호출합니다. 동이 없으면 dong을 비워 분당구 전체로 조회합니다.
+- 초·중등 혼합 과정 여부를 묻는 질문도 호출합니다. 공공데이터에 수강료 항목으로 본 대상(혼합 여부) 정보가 있습니다.
+- 반 유형·수업 시간·설명회처럼 공공데이터에 없는 정보만 묻는 질문은 호출하지 않습니다.
+  동 없이 반 유형(기초·내신대비·선행 등)·수업 시간·설명회를 찾는 질문도 호출하지 않습니다. 예: "중1 영어 기초부터 잡아주는 학원 있어?"
+- 분당구 밖 지역, 후기·평점·순위, 학원 찾기와 상관없는 질문은 호출하지 않습니다.
+- "판교 쪽"처럼 넓은 지역은 판교 생활권 동(판교동, 삼평동, 백현동, 운중동)으로 넣습니다.
+- 과목은 "수학" 또는 "영어"만 넣습니다."""
 
 
 def _structured_answer_model():
@@ -309,29 +344,59 @@ def _structured_answer_model():
     from pydantic import BaseModel, Field
 
     class RagAnswer(BaseModel):
-        answer: str = Field(description="학부모에게 보여 줄 답변. 학원 정보 뒤에는 (출처: 학원 소개 자료)를 붙인다")
-        used_doc_ids: list[str] = Field(description="답변에 근거로 쓴 조각의 doc_id 목록")
+        answer: str = Field(description="학부모에게 보여 줄 답변. 가상·실제 두 묶음으로 나누고 출처를 붙인다")
+        used_doc_ids: list[str] = Field(description="답변에 근거로 쓴 doc_id 목록 (virtual:... 또는 public:...)")
 
     return RagAnswer
 
 
-def _format_context(docs) -> str:
-    return "\n\n".join(f"[doc_id: {d.metadata['doc_id']}]\n{d.page_content}" for d in docs)
+def _virtual_items(docs) -> list[dict]:
+    """학원 소개 문서 조각 -> contexts 항목. doc_id에 virtual: 접두어를 붙입니다."""
+    return [{"doc_id": f"virtual:{d.metadata['doc_id']}", "text": d.page_content} for d in docs]
+
+
+def _public_items(public: dict | None) -> list[dict]:
+    """search_academies 결과 -> contexts 항목. doc_id에 public: 접두어를 붙입니다."""
+    if not public:
+        return []
+    return [{
+        "doc_id": f"public:{r['id']}",
+        "text": (f"[공공데이터·실제] 학원명: {r['학원명']} | 동: {r['동']} | 과목: {r['과목']} | "
+                 f"교습과정: {r['교습과정']} | 대상: {r['대상']} | 수강료(중등): {r['수강료(중등)']}"),
+    } for r in public["결과"]]
+
+
+def _format_items(items: list[dict]) -> str:
+    return "\n\n".join(f"[doc_id: {c['doc_id']}]\n{c['text']}" for c in items)
+
+
+def _format_public(public: dict | None) -> str:
+    if public is None:
+        return "(이번 질문에서는 조회하지 않음)"
+    cond = public["조건"]
+    head = (f"조회 조건: 동={cond['동']}, 과목={cond['과목']} / "
+            f"조건에 맞는 실제 학원 전체 {public['전체']}곳 중 {len(public['결과'])}곳 (학원명 가나다순, 순위 아님)")
+    if not public["결과"]:
+        return head + "\n조건에 맞는 실제 학원 없음"
+    return head + "\n\n" + _format_items(_public_items(public))
 
 
 def build_rag_graph():
     """가드레일을 두른 RAG 그래프를 만듭니다."""
     from langchain_aws import ChatBedrockConverse
+    from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_core.prompts import ChatPromptTemplate
     from langgraph.graph import END, START, StateGraph
 
     from src.retriever import retrieve
+    from src.tools import search_academies, search_academies_data
 
     class RagState(TypedDict, total=False):
         question: str          # mask 노드 이후에는 가린 질문으로 바뀝니다
         mask_counts: dict      # 그래프 밖(api.py)에서 미리 가린 항목 수. trace 기록용
         blocked: bool
-        docs: list
+        docs: list             # [가상] 학원 소개 문서 조각
+        public: dict | None    # [실제] search_academies 결과. 호출하지 않았으면 None
         answer: str
         used_doc_ids: list[str]
         contexts: list[dict]
@@ -341,6 +406,8 @@ def build_rag_graph():
     prompt = ChatPromptTemplate.from_messages([("system", SYSTEM_PROMPT), ("human", HUMAN_PROMPT)])
     # LCEL: 프롬프트 | 구조화 출력 모델. 결과가 RagAnswer 객체로 나옵니다.
     answer_chain = prompt | llm.with_structured_output(_structured_answer_model())
+    # 도구 호출용 모델: search_academies의 설명·인자 형식을 보고 호출 여부와 인자를 정합니다.
+    tool_llm = llm.bind_tools([search_academies])
 
     # ── 입력 가드레일 1: 마스킹 ─────────────────────────────
     def mask_node(state: RagState) -> dict:
@@ -370,24 +437,46 @@ def build_rag_graph():
             update.update({"answer": BLOCK_MESSAGE, "contexts": [], "docs": []})
         return update
 
+    # ── [가상] 학원 소개 문서 검색 ───────────────────────────
     def retrieve_node(state: RagState) -> dict:
         docs = retrieve(state["question"])
         step = {
             "step": "retrieve",
             "input": state["question"],
-            "output": f"{len(docs)}개 조각: " + ", ".join(d.metadata["doc_id"] for d in docs),
+            "output": f"[가상] {len(docs)}개 조각: " + ", ".join(f"virtual:{d.metadata['doc_id']}" for d in docs),
         }
         return {"docs": docs, "trace": state.get("trace", []) + [step]}
 
+    # ── [실제] 공공데이터 조회 도구 ──────────────────────────
+    def tool_call_node(state: RagState) -> dict:
+        ai = tool_llm.invoke([SystemMessage(content=TOOL_SYSTEM_PROMPT), HumanMessage(content=state["question"])])
+        calls = [c for c in (getattr(ai, "tool_calls", None) or []) if c["name"] == "search_academies"]
+        if not calls:
+            step = {"step": "tool_call", "input": "search_academies",
+                    "output": "호출 안 함 (공공데이터 조회가 필요 없는 질문으로 판단)"}
+            return {"public": None, "trace": state["trace"] + [step]}
+
+        args = calls[0]["args"]  # 한 질문에 한 번만 조회합니다
+        public = search_academies_data(args.get("dong"), args.get("subject"))
+        names = ", ".join(r["학원명"] for r in public["결과"]) or "없음"
+        step = {
+            "step": "tool_call",
+            "input": f"search_academies({json.dumps(args, ensure_ascii=False)})",
+            "output": f"[실제] 조건에 맞는 {public['전체']}곳 중 {len(public['결과'])}곳 전달 (가나다순): {names}",
+        }
+        return {"public": public, "trace": state["trace"] + [step]}
+
     def generate_node(state: RagState) -> dict:
         result = answer_chain.invoke({
-            "context": _format_context(state["docs"]),
+            "virtual_context": _format_items(_virtual_items(state["docs"])) or "(검색된 학원 소개 자료 없음)",
+            "public_context": _format_public(state.get("public")),
             "question": state["question"],
         })
+        n_public = len((state.get("public") or {}).get("결과", []))
         step = {
             "step": "generate",
-            "input": f"질문 + 문서 조각 {len(state['docs'])}개",
-            "output": f"근거 조각: {', '.join(result.used_doc_ids) or '없음'}",
+            "input": f"질문 + [가상] 조각 {len(state['docs'])}개 + [실제] 학원 {n_public}곳",
+            "output": f"근거: {', '.join(result.used_doc_ids) or '없음'}",
         }
         return {
             "answer": result.answer,
@@ -397,29 +486,36 @@ def build_rag_graph():
 
     # ── 출력 가드레일 ─────────────────────────────────────
     def output_guard_node(state: RagState) -> dict:
-        # contexts: 답변 근거로 쓴 조각. 모델이 id를 하나도 못 고르면 검색된 조각 전부를 넣습니다.
+        # contexts: 답변 근거로 쓴 항목. 모델이 id를 하나도 못 고르면 받은 근거 전부를 넣습니다.
+        pool = _virtual_items(state["docs"]) + _public_items(state.get("public"))
         used = set(state.get("used_doc_ids", []))
-        docs = [d for d in state["docs"] if d.metadata["doc_id"] in used] or state["docs"]
-        contexts = [{"doc_id": d.metadata["doc_id"], "text": d.page_content} for d in docs]
+        contexts = [c for c in pool if c["doc_id"] in used] or list(pool)
 
         # 1) 단정 추천 문장 제거 (SERVICE.md 정책 3)
         answer, removed = remove_ad_sentences(state["answer"])
 
         # 2) 학원 이름이 근거에 있는지 확인 (SERVICE.md 정책 1)
-        names = check_academy_names(answer, contexts, state["docs"])
+        names = check_academy_names(answer, contexts, pool)
         if names["ungrounded"]:
             answer += ("\n\n※ 다음 학원은 검색된 자료에서 확인되지 않았습니다: "
                        + ", ".join(names["ungrounded"]) + ". 학원에 직접 확인해 주세요.")
 
-        # 3) 답변에 개인정보가 되살아났으면 다시 가림 (SERVICE.md 정책 4)
+        # 3) 가상/실제 묶음이 답변에 표시됐는지 확인 (SERVICE.md 정책 2)
+        n_virtual = sum(c["doc_id"].startswith("virtual:") for c in contexts)
+        n_public = sum(c["doc_id"].startswith("public:") for c in contexts)
+        bundle = (f"묶음 표시: 가상 근거 {n_virtual}개·답변 '가상' 표시 {'O' if '가상' in answer else 'X'}, "
+                  f"실제 근거 {n_public}개·답변 '실제' 표시 {'O' if '실제' in answer else 'X'}")
+
+        # 4) 답변에 개인정보가 되살아났으면 다시 가림 (SERVICE.md 정책 4)
         answer, pii = mask_pii_report(answer)
 
         parts = [
             f"단정 추천 문장 제거 {len(removed)}개" + (f": {removed}" if removed else ""),
             f"학원 이름 {len(names['names'])}개 확인 (contexts에 있음 {len(names['ok'])}"
-            + (f", 검색 조각에서 근거 보강 {names['added']}" if names["added"] else "")
+            + (f", 받은 근거에서 보강 {names['added']}" if names["added"] else "")
             + (f", 근거 없음 {names['ungrounded']}" if names["ungrounded"] else "")
             + ")",
+            bundle,
             "답변 개인정보 " + (", ".join(f"{k} {v}개 가림" for k, v in pii.items()) if pii else "없음"),
         ]
         step = {"step": "output_guard", "input": f"답변 {len(state['answer'])}자", "output": " / ".join(parts)}
@@ -429,12 +525,14 @@ def build_rag_graph():
     g.add_node("mask", mask_node)
     g.add_node("input_guard", input_guard_node)
     g.add_node("retrieve", retrieve_node)
+    g.add_node("tool_call", tool_call_node)
     g.add_node("generate", generate_node)
     g.add_node("output_guard", output_guard_node)
     g.add_edge(START, "mask")
     g.add_edge("mask", "input_guard")
     g.add_conditional_edges("input_guard", lambda s: END if s["blocked"] else "retrieve", [END, "retrieve"])
-    g.add_edge("retrieve", "generate")
+    g.add_edge("retrieve", "tool_call")
+    g.add_edge("tool_call", "generate")
     g.add_edge("generate", "output_guard")
     g.add_edge("output_guard", END)
     return g.compile()
