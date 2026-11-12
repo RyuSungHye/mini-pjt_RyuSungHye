@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 import os
 import sys
@@ -131,7 +132,27 @@ def judge_one(chain, row: dict, ans: dict) -> dict:
 
 # ── 2. RAGAS ───────────────────────────────────────────────────
 
+class _ErrorCollector(logging.Handler):
+    """RAGAS가 실패한 작업을 로그로만 남기므로, 그 메시지를 모아 둡니다 (한도 에러 확인용)."""
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
 def run_ragas(rows: list[dict], answers: dict) -> dict:
+    # RAGAS 채점 호출은 LangSmith에 올리지 않습니다 (에이전트 추적과 섞이지 않게)
+    os.environ["LANGSMITH_TRACING"] = "false"
+    os.environ["LANGCHAIN_TRACING_V2"] = "false"
+    try:
+        from langsmith import utils as ls_utils
+        ls_utils.get_env_var.cache_clear()
+    except Exception:  # noqa: BLE001
+        pass
+
     from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
     from ragas import EvaluationDataset, RunConfig, evaluate
     from ragas.embeddings import LangchainEmbeddingsWrapper
@@ -147,16 +168,25 @@ def run_ragas(rows: list[dict], answers: dict) -> dict:
         "reference": r["reference"],
     } for r in targets])
 
-    llm = LangchainLLMWrapper(ChatBedrockConverse(model=JUDGE_MODEL_ID, region_name=REGION, temperature=0))
+    from botocore.config import Config
+
+    # read_timeout: AWS 응답을 기다리는 시간(초). 기본 60초는 2차의 긴 답변 채점에 부족해 300초로 늘림 (채점 방식은 그대로)
+    llm = LangchainLLMWrapper(ChatBedrockConverse(model=JUDGE_MODEL_ID, region_name=REGION, temperature=0,
+                                                  config=Config(read_timeout=300)))
     emb = LangchainEmbeddingsWrapper(BedrockEmbeddings(model_id=EMBED_MODEL_ID, region_name=REGION))
+    collector = _ErrorCollector()
+    logging.getLogger("ragas.executor").addHandler(collector)
     result = evaluate(
         dataset,
         metrics=[LLMContextRecall(), LLMContextPrecisionWithReference(), Faithfulness(), ResponseRelevancy()],
         llm=llm, embeddings=emb,
-        run_config=RunConfig(max_retries=1, max_workers=2, timeout=180),
-        raise_exceptions=True,   # 한도 에러를 NaN으로 숨기지 않고 멈춥니다
+        # timeout: 호출 1번의 제한 시간(초). 2차는 답변·근거가 길어져 180초로는 부족해 600초로 늘림 (채점 방식은 그대로)
+        run_config=RunConfig(max_retries=1, max_workers=2, timeout=600),
+        # 한 문항·지표가 실패해도 전체를 멈추지 않고 그 칸만 NaN으로 둡니다. 실패 목록은 아래에서 기록.
+        raise_exceptions=False,
         show_progress=False,
     )
+    logging.getLogger("ragas.executor").removeHandler(collector)
 
     df = result.to_pandas()
     names = {"context_recall": "context_recall", "llm_context_precision_with_reference": "context_precision",
@@ -170,7 +200,10 @@ def run_ragas(rows: list[dict], answers: dict) -> dict:
     for short in names.values():
         vals = [v[short] for v in per_q.values() if v[short] is not None]
         means[short] = round(sum(vals) / len(vals), 3) if vals else None
-    return {"question_ids": [r["id"] for r in targets], "per_question": per_q, "mean": means}
+    failed = [{"id": qid, "metric": m} for qid, v in per_q.items() for m, x in v.items() if x is None]
+    return {"question_ids": [r["id"] for r in targets], "per_question": per_q, "mean": means,
+            "failed": failed, "errors": collector.messages,
+            "throttled": any(is_throttle(Exception(m)) for m in collector.messages)}
 
 
 # ── 실행 ──────────────────────────────────────────────────────
@@ -221,6 +254,12 @@ def main() -> int:
                 return 2
             raise
         save(scores_path, scores)
+        if scores["ragas"]["failed"]:
+            print("RAGAS 실패(NaN) 항목:", scores["ragas"]["failed"])
+            print("에러:", scores["ragas"]["errors"][:5])
+        if scores["ragas"]["throttled"]:
+            print("멈춤: RAGAS 중 ThrottlingException 발생. 재시도하지 않습니다.")
+            return 2
 
     passed = sum(1 for v in judged.values() if v["passed"])
     print(f"\n통과 {passed}/{len(rows)}")
