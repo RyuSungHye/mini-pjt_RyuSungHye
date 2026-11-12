@@ -73,12 +73,30 @@ def _fee_items(row: dict) -> list[tuple[str, str]]:
     return items
 
 
-def _middle_fee(row: dict) -> str:
+def _middle_fee_values(row: dict) -> list[tuple[str, int]]:
+    """중등 수강료 항목을 (이름, 금액) 숫자로. 공개하지 않았거나 값이 없으면 빈 목록."""
     if (row.get("수강료공개여부") or "").strip() != "Y":
-        return "정보 없음"
-    fees = [f"{label} {int(amount):,}원" for label, amount in _fee_items(row)
+        return []
+    return [(label, int(amount)) for label, amount in _fee_items(row)
             if any(w in label for w in MIDDLE_WORDS) and amount.isdigit()]
+
+
+def _middle_fee(row: dict) -> str:
+    fees = [f"{label} {amount:,}원" for label, amount in _middle_fee_values(row)]
     return ", ".join(fees) or "정보 없음"
+
+
+SORT_LABELS = {"fee_asc": "최저 수강료 낮은 순", "fee_desc": "최저 수강료 높은 순"}
+
+
+def _fee_condition_text(min_fee: int | None, max_fee: int | None) -> str:
+    if min_fee and max_fee:
+        return f"중등 수강료 {min_fee:,}원 이상 {max_fee:,}원 이하인 과정이 있는 학원"
+    if max_fee:
+        return f"중등 수강료 {max_fee:,}원 이하인 과정이 있는 학원"
+    if min_fee:
+        return f"중등 수강료 {min_fee:,}원 이상인 과정이 있는 학원"
+    return "없음"
 
 
 def _target(row: dict) -> str:
@@ -101,11 +119,22 @@ def normalize_dong(name: str) -> str:
     return name if not name or name.endswith("동") else name + "동"
 
 
-def search_academies_data(dong: list[str] | str | None = None, subject: str | None = None) -> dict:
-    """검색 결과를 dict로 돌려줍니다. 에이전트는 이 함수를 직접 씁니다."""
+def search_academies_data(dong: list[str] | str | None = None, subject: str | None = None,
+                          sort: str | None = None, max_fee: int | None = None,
+                          min_fee: int | None = None) -> dict:
+    """검색 결과를 dict로 돌려줍니다. 에이전트는 이 함수를 직접 씁니다.
+
+    sort: "fee_asc"(최저 수강료 낮은 순) / "fee_desc"(높은 순). 없으면 학원명 가나다순.
+    max_fee / min_fee: 중등 수강료 조건(원). 조건 범위에 드는 중등 과정이 하나라도 있으면 통과.
+    정렬·거르기는 조건에 맞는 학원 전체에 먼저 적용한 뒤 MAX_RESULTS개로 자릅니다.
+    수강료 정보가 없는 학원은 정렬·거르기 대상에서 빼고 "수강료 정보 없음" 목록에 따로 둡니다.
+    """
     dongs = [dong] if isinstance(dong, str) else list(dong or [])
     dongs = [d for d in (normalize_dong(x) for x in dongs) if d]
     subject = subject if subject in SUBJECT_KEYWORDS else None
+    sort = sort if sort in SORT_LABELS else None
+    max_fee = int(max_fee) if max_fee else None
+    min_fee = int(min_fee) if min_fee else None
 
     matches = []
     for row in _load_rows():
@@ -121,6 +150,7 @@ def search_academies_data(dong: list[str] | str | None = None, subject: str | No
         subjects = _subjects(row)
         if subject and subject not in subjects:
             continue  # 과목 "정보 없음"인 학원도 여기서 빠집니다
+        fee_values = _middle_fee_values(row)
         matches.append({
             "id": row.get("학원지정번호") or row.get("학원명"),
             "학원명": row.get("학원명", ""),
@@ -129,25 +159,65 @@ def search_academies_data(dong: list[str] | str | None = None, subject: str | No
             "교습과정": f"{row.get('교습과정명', '')} ({row.get('교습과정목록명', '')})",
             "대상": _target(row),
             "수강료(중등)": _middle_fee(row),
+            # 코드로 계산한 중등 최저 수강료 (원). 정보 없으면 None
+            "_fees": fee_values,
+            "_min_fee": min(a for _, a in fee_values) if fee_values else None,
         })
 
-    matches.sort(key=lambda m: m["학원명"])  # 가나다순. 순위가 아닙니다.
+    matches.sort(key=lambda m: m["학원명"])  # 기본: 가나다순. 순위가 아닙니다.
+    total = len(matches)
+    fee_mode = bool(sort or max_fee or min_fee)
+    no_fee = [m for m in matches if m["_min_fee"] is None] if fee_mode else []
+    pool = [m for m in matches if m["_min_fee"] is not None] if fee_mode else matches
+
+    # 수강료 조건: 범위에 드는 중등 과정이 하나라도 있는 학원만 (조건에 맞는 과정 이름도 적어 둠)
+    if max_fee or min_fee:
+        kept = []
+        for m in pool:
+            ok = [(l, a) for l, a in m["_fees"]
+                  if (not max_fee or a <= max_fee) and (not min_fee or a >= min_fee)]
+            if ok:
+                m["조건에 맞는 과정"] = ", ".join(f"{l} {a:,}원" for l, a in ok)
+                kept.append(m)
+        pool = kept
+
+    # 정렬: 학원별 최저 수강료 기준. 같으면 학원명 가나다순
+    if sort:
+        pool.sort(key=lambda m: (m["_min_fee"] if sort == "fee_asc" else -m["_min_fee"], m["학원명"]))
+
+    results = []
+    for i, m in enumerate(pool[:MAX_RESULTS], start=1):
+        item = {k: v for k, v in m.items() if not k.startswith("_")}
+        if fee_mode:
+            item["최저 수강료(중등)"] = f"{m['_min_fee']:,}원"
+        if sort:
+            item["순서"] = i
+        results.append(item)
+
     return {
-        "조건": {"동": dongs or "분당구 전체", "과목": subject or "전체"},
-        "전체": len(matches),
-        "결과": matches[:MAX_RESULTS],
+        "조건": {"동": dongs or "분당구 전체", "과목": subject or "전체",
+                 "정렬": SORT_LABELS.get(sort, "학원명 가나다순 (순위 아님)"),
+                 "수강료 조건": _fee_condition_text(min_fee, max_fee)},
+        "전체": total,                        # 동·과목 조건에 맞는 학원 수
+        "수강료 조건 통과": len(pool) if fee_mode else None,  # 정렬·거르기 대상 중 남은 수
+        "결과": results,
+        "수강료 정보 없음": [m["학원명"] for m in no_fee],  # 정렬·거르기에서 빠진 학원 (맨 뒤에 따로 표시)
     }
 
 
 @tool
-def search_academies(dong: list[str] | None = None, subject: str | None = None) -> str:
+def search_academies(dong: list[str] | None = None, subject: str | None = None,
+                     sort: str | None = None, max_fee: int | None = None, min_fee: int | None = None) -> str:
     """분당구 실제 학원(공공데이터: 나이스 학원교습소정보)을 동·과목으로 조회한다.
     중학생 대상, 운영 중(개원)인 학원만 돌려준다. 학원명·동·과목·교습과정·중등 수강료를 준다.
-    반 이름·수업 시간·설명회 정보는 없다.
+    반 이름·수업 시간·설명회 정보는 없다. 수강료 정렬·거르기는 이 도구가 코드로 계산한다.
 
     Args:
         dong: 동 이름 목록. 예: ["수내동"]. "판교 쪽"처럼 넓은 지역은 ["판교동", "삼평동", "백현동", "운중동"].
               비우면 분당구 전체.
         subject: "수학" 또는 "영어". 비우면 과목 무관.
+        sort: 수강료 정렬. "fee_asc"(싼 순·낮은 순), "fee_desc"(비싼 순·높은 순). 비우면 학원명 가나다순.
+        max_fee: 월 수강료 상한(원). 예: "30만 원 이하" -> 300000.
+        min_fee: 월 수강료 하한(원). 예: "20만 원 이상" -> 200000.
     """
-    return json.dumps(search_academies_data(dong, subject), ensure_ascii=False)
+    return json.dumps(search_academies_data(dong, subject, sort, max_fee, min_fee), ensure_ascii=False)

@@ -307,7 +307,11 @@ SYSTEM_PROMPT = """당신은 성남시 분당구 중학생 학부모를 돕는 "
 - 가상 학원 이름 뒤에는 "(가상)", 실제 학원 이름 뒤에는 "(실제)"를 붙입니다.
 - 두 묶음을 한 표나 한 순위로 합치지 않습니다. 교습비 비교도 같은 묶음 안에서만 합니다.
 - 한쪽 자료에 맞는 내용이 없으면 그 묶음에 "해당 자료 없음" 또는 "이번 질문에서는 조회하지 않음"이라고 짧게 씁니다.
-- 공공데이터 목록은 학원명 가나다순이며 순위가 아닙니다. 전체 개수가 더 많으면 일부만 보여 준다고 알립니다.
+- 공공데이터 목록 순서는 도구가 정한 것입니다 (기본은 학원명 가나다순, 요청하면 최저 수강료 순). 추천 순위가 아닙니다. 전체 개수가 더 많으면 일부만 보여 준다고 알립니다.
+- 수강료 정렬·거르기는 코드가 이미 계산했습니다. 도구가 정렬한 순서를 바꾸지 말고, 직접 다시 정렬하거나 금액을 계산·비교하지 않습니다. 받은 순서와 "최저 수강료", "조건에 맞는 과정" 값을 그대로 씁니다.
+- [가상 학원 교습비 정리 (코드 계산)]가 있으면 가상 묶음의 교습비 비교는 그 순서와 값을 그대로 씁니다.
+- "수강료 정보 없음" 학원은 정렬·거르기 결과 뒤에 따로 적습니다.
+- 질문에 나오지 않은 과목은 언급하지 않습니다. 예: 수학만 물었으면 "영어 학원: 조회하지 않음" 같은 문장을 쓰지 않습니다.
 - 공공데이터에는 반 이름·수업 시간·설명회 정보가 없습니다. 이런 정보는 "확인할 수 없음"으로 답합니다.
 
 규칙
@@ -341,7 +345,11 @@ TOOL_SYSTEM_PROMPT = """당신은 분당구 학원 찾기 도우미의 도구 �
   동 없이 반 유형(기초·내신대비·선행 등)·수업 시간·설명회를 찾는 질문도 호출하지 않습니다. 예: "중1 영어 기초부터 잡아주는 학원 있어?"
 - 분당구 밖 지역, 후기·평점·순위, 학원 찾기와 상관없는 질문은 호출하지 않습니다.
 - "판교 쪽"처럼 넓은 지역은 판교 생활권 동(판교동, 삼평동, 백현동, 운중동)으로 넣습니다.
-- 과목은 "수학" 또는 "영어"만 넣습니다."""
+- 과목은 "수학" 또는 "영어"만 넣습니다.
+- 수강료로 정렬해 달라는 질문(싼 순, 낮은 순, 저렴한 순)이면 sort="fee_asc", 비싼 순·높은 순이면 sort="fee_desc"를 넣습니다.
+  "교습비 비교해줘"처럼 수강료를 비교하는 질문도 sort="fee_asc"를 넣습니다.
+- "월 30만 원 이하", "30만 원 안쪽"처럼 상한이 있으면 max_fee=300000, "20만 원 이상"처럼 하한이 있으면 min_fee=200000을 원 단위 숫자로 넣습니다.
+- 수강료 조건·정렬이 없으면 sort, max_fee, min_fee는 비웁니다."""
 
 
 # ② 동·과목 필터용 조건. 도구를 부르지 않은 질문은 질문 속 낱말에서 직접 뽑습니다.
@@ -434,11 +442,89 @@ def _public_items(public: dict | None) -> list[dict]:
     """search_academies 결과 -> contexts 항목. doc_id에 public: 접두어를 붙입니다."""
     if not public:
         return []
-    return [{
-        "doc_id": f"public:{r['id']}",
-        "text": (f"[공공데이터·실제] 학원명: {r['학원명']} | 동: {r['동']} | 과목: {r['과목']} | "
-                 f"교습과정: {r['교습과정']} | 대상: {r['대상']} | 수강료(중등): {r['수강료(중등)']}"),
-    } for r in public["결과"]]
+    items = []
+    for r in public["결과"]:
+        text = (f"[공공데이터·실제] 학원명: {r['학원명']} | 동: {r['동']} | 과목: {r['과목']} | "
+                f"교습과정: {r['교습과정']} | 대상: {r['대상']} | 수강료(중등): {r['수강료(중등)']}")
+        if "순서" in r:
+            text = f"[{r['순서']}번째] " + text
+        if "최저 수강료(중등)" in r:
+            text += f" | 최저 수강료(중등, 코드 계산): {r['최저 수강료(중등)']}"
+        if "조건에 맞는 과정" in r:
+            text += f" | 수강료 조건에 맞는 과정: {r['조건에 맞는 과정']}"
+        items.append({"doc_id": f"public:{r['id']}", "text": text})
+    return items
+
+
+# ── 가상 학원 교습비 정리: 반 구성 표에서 월 교습비를 숫자로 뽑아 코드로 정렬·거릅니다 ──
+FEE_WORDS = re.compile(r"교습비|수강료|수업료|학원비")
+
+
+def _parse_won(text: str) -> int | None:
+    """'35만 원' -> 350000, '180,000원' -> 180000, '정보 없음' -> None"""
+    m = re.search(r"(\d+)\s*만", text)
+    if m:
+        return int(m.group(1)) * 10000
+    m = re.search(r"([\d,]{4,})\s*원", text)
+    return int(m.group(1).replace(",", "")) if m else None
+
+
+def _virtual_classes(docs) -> list[dict]:
+    """'반 구성' 조각의 표에서 (학원, 반, 대상, 월 교습비)를 뽑습니다."""
+    classes = []
+    for d in docs:
+        if d.metadata.get("section") != "반 구성":
+            continue
+        rows = [l for l in d.page_content.splitlines() if l.strip().startswith("|")]
+        if len(rows) < 3:
+            continue
+        head = [c.strip() for c in rows[0].strip().strip("|").split("|")]
+        fee_col = next((i for i, h in enumerate(head) if "교습비" in h), None)
+        if fee_col is None:
+            continue
+        for row in rows[2:]:
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            if len(cells) != len(head):
+                continue
+            classes.append({"학원": d.metadata["academy"], "반": cells[0],
+                            "대상": cells[1] if len(cells) > 1 else "",
+                            "교습비 표기": cells[fee_col], "교습비": _parse_won(cells[fee_col])})
+    return classes
+
+
+def virtual_fee_summary(docs, sort: str | None, max_fee: int | None, min_fee: int | None) -> tuple[str, str]:
+    """가상 학원 반별 교습비를 코드로 정렬·거른 표. (모델에 넘길 글, trace용 요약)"""
+    classes = _virtual_classes(docs)
+    if not classes:
+        return "", "가상 교습비 정리: 반 구성 표 없음"
+    known = [c for c in classes if c["교습비"] is not None]
+    unknown = [c for c in classes if c["교습비"] is None]
+    if max_fee or min_fee:
+        kept = [c for c in known if (not max_fee or c["교습비"] <= max_fee) and (not min_fee or c["교습비"] >= min_fee)]
+        dropped = len(known) - len(kept)
+    else:
+        kept, dropped = known, 0
+    desc = sort == "fee_desc"
+    kept.sort(key=lambda c: (-c["교습비"] if desc else c["교습비"], c["학원"], c["반"]))
+    order = "월 교습비 높은 순" if desc else "월 교습비 낮은 순"
+    cond = []
+    if max_fee:
+        cond.append(f"{max_fee:,}원 이하")
+    if min_fee:
+        cond.append(f"{min_fee:,}원 이상")
+    lines = [f"[가상 학원 교습비 정리 (코드 계산)] 반 단위, {order}"
+             + (f", 조건: {' '.join(cond)} (조건 밖 {dropped}개 반 제외)" if cond else "")]
+    lines += [f"{i}. {c['학원']} (가상) - {c['반']} ({c['대상']}): {c['교습비 표기']}"
+              for i, c in enumerate(kept, start=1)]
+    if not kept:
+        lines.append("조건에 맞는 반 없음")
+    if unknown:
+        lines.append("교습비 정보 없음 (정렬 대상 아님, 맨 뒤에 따로 표시): "
+                     + ", ".join(f"{c['학원']} {c['반']}" for c in unknown))
+    summary = (f"가상 교습비 정리: {len(classes)}개 반 중 {order} {len(kept)}개"
+               + (f" (조건 {' '.join(cond)}, 제외 {dropped}개)" if cond else "")
+               + f", 정보 없음 {len(unknown)}개")
+    return "\n".join(lines), summary
 
 
 def _format_items(items: list[dict]) -> str:
@@ -449,11 +535,20 @@ def _format_public(public: dict | None) -> str:
     if public is None:
         return "(이번 질문에서는 조회하지 않음)"
     cond = public["조건"]
-    head = (f"조회 조건: 동={cond['동']}, 과목={cond['과목']} / "
-            f"조건에 맞는 실제 학원 전체 {public['전체']}곳 중 {len(public['결과'])}곳 (학원명 가나다순, 순위 아님)")
+    head = f"조회 조건: 동={cond['동']}, 과목={cond['과목']}"
+    if public.get("수강료 조건 통과") is None:
+        head += (f" / 조건에 맞는 실제 학원 전체 {public['전체']}곳 중 {len(public['결과'])}곳 "
+                 f"(학원명 가나다순, 순위 아님)")
+    else:
+        head += (f", 수강료 조건={cond['수강료 조건']}, 정렬={cond['정렬']} (코드로 계산함, 추천 순위 아님)\n"
+                 f"동·과목에 맞는 {public['전체']}곳 중 수강료 정보가 있는 학원을 거르고 정렬한 결과 "
+                 f"{public['수강료 조건 통과']}곳, 그중 앞에서부터 {len(public['결과'])}곳을 이 순서대로 보여 줍니다. "
+                 f"순서를 바꾸지 마세요.")
+    no_fee = public.get("수강료 정보 없음") or []
+    tail = (f"\n\n수강료 정보 없음 (정렬·거르기 대상 아님, 맨 뒤에 따로 표시): {', '.join(no_fee)}" if no_fee else "")
     if not public["결과"]:
-        return head + "\n조건에 맞는 실제 학원 없음"
-    return head + "\n\n" + _format_items(_public_items(public))
+        return head + "\n조건에 맞는 실제 학원 없음" + tail
+    return head + "\n\n" + _format_items(_public_items(public)) + tail
 
 
 def build_rag_graph():
@@ -565,31 +660,49 @@ def build_rag_graph():
                     "trace": state["trace"] + [step]}
 
         args = calls[0]["args"]  # 한 질문에 한 번만 조회합니다
-        public = search_academies_data(args.get("dong"), args.get("subject"))
-        # 도구 인자를 가상 학원 검색 필터로 재활용합니다.
+        public = search_academies_data(args.get("dong"), args.get("subject"),
+                                       sort=args.get("sort"), max_fee=args.get("max_fee"), min_fee=args.get("min_fee"))
+        # 도구 인자를 가상 학원 검색 필터·교습비 정리에 재활용합니다.
         raw_dongs = args.get("dong") or []
         raw_dongs = [raw_dongs] if isinstance(raw_dongs, str) else raw_dongs
         conditions = {"dong": [normalize_dong(d) for d in raw_dongs] or None,
                       "subject": args.get("subject") if args.get("subject") in ("수학", "영어") else None,
+                      "sort": args.get("sort"), "max_fee": args.get("max_fee"), "min_fee": args.get("min_fee"),
                       "source": "tool_call 인자"}
+        cond = public["조건"]
+        if public["수강료 조건 통과"] is None:
+            flow = f"조건에 맞는 {public['전체']}곳 중 {len(public['결과'])}곳 전달 (가나다순)"
+        else:
+            flow = (f"동·과목 조건 {public['전체']}곳 -> 수강료 정보 없음 {len(public['수강료 정보 없음'])}곳 따로 -> "
+                    f"수강료 조건({cond['수강료 조건']}) 통과 {public['수강료 조건 통과']}곳 -> "
+                    f"정렬({cond['정렬']}) -> {len(public['결과'])}곳 전달")
         names = ", ".join(r["학원명"] for r in public["결과"]) or "없음"
         step = {
             "step": "tool_call",
             "input": f"search_academies({json.dumps(args, ensure_ascii=False)})",
-            "output": f"[실제] 조건에 맞는 {public['전체']}곳 중 {len(public['결과'])}곳 전달 (가나다순): {names}",
+            "output": f"[실제] {flow}: {names}",
         }
         return {"public": public, "conditions": conditions, "trace": state["trace"] + [step]}
 
     def generate_node(state: RagState) -> dict:
+        virtual_context = _format_items(_virtual_items(state["docs"])) or "(검색된 학원 소개 자료 없음)"
+        # 수강료 비교·정렬·조건이 있는 질문이면 가상 학원 교습비도 코드로 정리해 앞에 붙입니다.
+        cond = state.get("conditions") or {}
+        fee_note = ""
+        if cond.get("sort") or cond.get("max_fee") or cond.get("min_fee") or FEE_WORDS.search(state["question"]):
+            table, fee_note = virtual_fee_summary(state["docs"], cond.get("sort"), cond.get("max_fee"), cond.get("min_fee"))
+            if table:
+                virtual_context = table + "\n\n" + virtual_context
         result = answer_chain.invoke({
-            "virtual_context": _format_items(_virtual_items(state["docs"])) or "(검색된 학원 소개 자료 없음)",
+            "virtual_context": virtual_context,
             "public_context": _format_public(state.get("public")),
             "question": state["question"],
         })
         n_public = len((state.get("public") or {}).get("결과", []))
         step = {
             "step": "generate",
-            "input": f"질문 + [가상] 조각 {len(state['docs'])}개 + [실제] 학원 {n_public}곳",
+            "input": (f"질문 + [가상] 조각 {len(state['docs'])}개 + [실제] 학원 {n_public}곳"
+                      + (f" + {fee_note}" if fee_note else "")),
             "output": f"근거: {', '.join(result.used_doc_ids) or '없음'}",
         }
         return {
