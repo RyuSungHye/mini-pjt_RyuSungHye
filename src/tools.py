@@ -91,6 +91,9 @@ def _middle_fee(row: dict) -> str:
     return ", ".join(fees) or "정보 없음"
 
 
+LOW_FEE_LIMIT = 100_000  # 특강을 뺀 최저 수강료가 이보다 낮으면 월 수강료가 아닐 수 있어 주의 표시
+LOW_FEE_NOTE = "회차·주말 단위 요금일 수 있으니 학원에 확인하세요"
+
 SORT_LABELS = {"fee_asc": "최저 수강료 낮은 순", "fee_desc": "최저 수강료 높은 순"}
 
 
@@ -198,6 +201,10 @@ def search_academies_data(dong: list[str] | str | None = None, subject: str | No
         item = {k: v for k, v in m.items() if not k.startswith("_")}
         if fee_mode:
             item["최저 수강료(중등)"] = f"{m['_min_fee']:,}원"
+        # 월 수강료로 보기엔 너무 낮은 금액: 빼지 않고 주의 표시만 붙입니다 (정렬 순서는 그대로)
+        low = [a for _, a in m["_fees"] if a < LOW_FEE_LIMIT]
+        if low:
+            item["주의"] = f"{min(low):,}원 과정은 {LOW_FEE_NOTE}"
         if sort:
             item["순서"] = i
         results.append(item)
@@ -209,8 +216,11 @@ def search_academies_data(dong: list[str] | str | None = None, subject: str | No
         "전체": total,                        # 동·과목 조건에 맞는 학원 수
         "수강료 조건 통과": len(pool) if fee_mode else None,  # 정렬·거르기 대상 중 남은 수
         "결과": results,
+        "낮은 금액 주의": [r["학원명"] for r in results if "주의" in r],
         # 정렬·거르기에서 빠진 학원 (맨 뒤에 따로 표시). 특강 과정만 있는 학원도 여기에 둡니다.
         "수강료 정보 없음": [m["학원명"] + (" (특강 과정만 있음)" if m["_special_only"] else "") for m in no_fee],
+        # 위 학원들의 상세 (검색 결과에 있는 학원임을 확인할 때 씀)
+        "수강료 정보 없음 상세": [{k: v for k, v in m.items() if not k.startswith("_")} for m in no_fee],
     }
 
 

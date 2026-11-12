@@ -311,6 +311,7 @@ SYSTEM_PROMPT = """당신은 성남시 분당구 중학생 학부모를 돕는 "
 - 수강료 정렬·거르기는 코드가 이미 계산했습니다. 도구가 정렬한 순서를 바꾸지 말고, 직접 다시 정렬하거나 금액을 계산·비교하지 않습니다. 받은 순서와 "최저 수강료", "조건에 맞는 과정" 값을 그대로 씁니다.
 - [가상 학원 교습비 정리]가 있으면 가상 묶음의 교습비 비교는 그 순서와 값을 그대로 씁니다.
 - "수강료 정보 없음" 학원은 정렬·거르기 결과 뒤에 따로 적습니다.
+- 공공데이터 학원에 "주의"가 붙어 있으면 그 학원 옆에 주의 문구를 그대로 적습니다. 그 학원을 빼거나 순서를 바꾸지 않습니다.
 - 한 학원 안의 수강료 과정 목록은 받은 순서 그대로 적습니다. 과정을 금액순 등으로 바꿔 적지 않습니다.
 - 최저 수강료와 수강료 조건 판단에는 특강 과정이 빠져 있습니다. 특강 과정도 목록에는 그대로 적습니다.
 - 답변에 "코드 계산", "도구", "contexts", "doc_id" 같은 내부 표현을 쓰지 않습니다. 학부모가 읽는 말로만 씁니다.
@@ -344,7 +345,9 @@ TOOL_SYSTEM_PROMPT = """당신은 분당구 학원 찾기 도우미의 도구 �
 질문을 보고 실제 학원(공공데이터) 조회가 필요하면 search_academies를 한 번 호출합니다.
 - 동(지역)이나 과목으로 학원 목록·교습비를 찾는 질문이면 호출합니다. 동이 없으면 dong을 비워 분당구 전체로 조회합니다.
 - 초·중등 혼합 과정 여부를 묻는 질문도 호출합니다. 공공데이터에 수강료 항목으로 본 대상(혼합 여부) 정보가 있습니다.
-- 반 유형·수업 시간·설명회처럼 공공데이터에 없는 정보만 묻는 질문은 호출하지 않습니다.
+- 질문에 동과 과목(수학·영어)이 함께 있으면, 반 유형·수업 시간을 묻는 질문이어도 호출합니다.
+  예: "야탑동에 중2 영어 내신대비반 있어?" -> dong=["야탑동"], subject="영어"
+- 동 없이 반 유형·수업 시간·설명회처럼 공공데이터에 없는 정보만 묻는 질문은 호출하지 않습니다.
   동 없이 반 유형(기초·내신대비·선행 등)·수업 시간·설명회를 찾는 질문도 호출하지 않습니다. 예: "중1 영어 기초부터 잡아주는 학원 있어?"
 - 분당구 밖 지역, 후기·평점·순위, 학원 찾기와 상관없는 질문은 호출하지 않습니다.
 - "판교 쪽"처럼 넓은 지역은 판교 생활권 동(판교동, 삼평동, 백현동, 운중동)으로 넣습니다.
@@ -455,8 +458,20 @@ def _public_items(public: dict | None) -> list[dict]:
             text += f" | 최저 수강료(중등, 특강 제외): {r['최저 수강료(중등)']}"
         if "조건에 맞는 과정" in r:
             text += f" | 수강료 조건에 맞는 과정: {r['조건에 맞는 과정']}"
+        if "주의" in r:
+            text += f" | 주의: {r['주의']}"
         items.append({"doc_id": f"public:{r['id']}", "text": text})
     return items
+
+
+def _public_no_fee_items(public: dict | None) -> list[dict]:
+    """정렬·거르기에서 빠진 '수강료 정보 없음' 학원 -> contexts 항목 (학원 이름이 근거에 있는지 확인할 때 씀)."""
+    return [{
+        "doc_id": f"public:{r['id']}",
+        "text": (f"[공공데이터·실제] 학원명: {r['학원명']} | 동: {r['동']} | 과목: {r['과목']} | "
+                 f"교습과정: {r['교습과정']} | 대상: {r['대상']} | 수강료(중등): {r['수강료(중등)']} "
+                 f"| 정렬·수강료 조건 대상 아님 (수강료 정보 없음 또는 특강 과정만 있음)"),
+    } for r in (public or {}).get("수강료 정보 없음 상세", [])]
 
 
 # ── 가상 학원 교습비 정리: 반 구성 표에서 월 교습비를 숫자로 뽑아 코드로 정렬·거릅니다 ──
@@ -562,7 +577,7 @@ def build_rag_graph():
     from langgraph.graph import END, START, StateGraph
 
     from src.retriever import retrieve_academies
-    from src.tools import normalize_dong, search_academies, search_academies_data
+    from src.tools import LOW_FEE_NOTE, normalize_dong, search_academies, search_academies_data
 
     class RagState(TypedDict, total=False):
         question: str          # mask 노드 이후에는 가린 질문으로 바뀝니다
@@ -656,9 +671,17 @@ def build_rag_graph():
     def tool_call_node(state: RagState) -> dict:
         ai = tool_llm.invoke([SystemMessage(content=TOOL_SYSTEM_PROMPT), HumanMessage(content=state["question"])])
         calls = [c for c in (getattr(ai, "tool_calls", None) or []) if c["name"] == "search_academies"]
+        how = "모델 판단"
+        if not calls:
+            # 코드 규칙: 질문에 동과 과목이 함께 있으면 반 유형 질문이어도 공공데이터를 조회합니다.
+            kw = extract_conditions(state["question"])
+            subjects = detect_subjects(state["question"])[0]
+            if kw["dong"] and subjects:
+                calls = [{"args": {"dong": kw["dong"], "subject": subjects[0] if len(subjects) == 1 else None}}]
+                how = "코드 규칙 (질문에 동·과목이 있어 호출)"
         if not calls:
             step = {"step": "tool_call", "input": "search_academies",
-                    "output": "호출 안 함 (공공데이터 조회가 필요 없는 질문으로 판단)"}
+                    "output": "호출 안 함 (공공데이터 조회가 필요 없는 질문으로 판단, 질문에 동·과목이 함께 있지 않음)"}
             return {"public": None, "conditions": extract_conditions(state["question"]),
                     "trace": state["trace"] + [step]}
 
@@ -683,7 +706,8 @@ def build_rag_graph():
         step = {
             "step": "tool_call",
             "input": f"search_academies({json.dumps(args, ensure_ascii=False)})",
-            "output": f"[실제] {flow}: {names}",
+            "output": f"[실제] 호출 근거: {how} / {flow}: {names}"
+                      + (f" / 낮은 금액 주의 표시: {', '.join(public['낮은 금액 주의'])}" if public.get("낮은 금액 주의") else ""),
         }
         return {"public": public, "conditions": conditions, "trace": state["trace"] + [step]}
 
@@ -717,7 +741,8 @@ def build_rag_graph():
     # ── 출력 가드레일 ─────────────────────────────────────
     def output_guard_node(state: RagState) -> dict:
         # contexts: 답변 근거로 쓴 항목. 모델이 id를 하나도 못 고르면 받은 근거 전부를 넣습니다.
-        pool = _virtual_items(state["docs"]) + _public_items(state.get("public"))
+        pool = (_virtual_items(state["docs"]) + _public_items(state.get("public"))
+                + _public_no_fee_items(state.get("public")))  # 수강료 정보 없음 학원도 검색 결과에 포함
         used = set(state.get("used_doc_ids", []))
         contexts = [c for c in pool if c["doc_id"] in used] or list(pool)
 
@@ -736,6 +761,12 @@ def build_rag_graph():
         bundle = (f"묶음 표시: 가상 근거 {n_virtual}개·답변 '가상' 표시 {'O' if '가상' in answer else 'X'}, "
                   f"실제 근거 {n_public}개·답변 '실제' 표시 {'O' if '실제' in answer else 'X'}")
 
+        # 3-1) 월 수강료로 보기엔 너무 낮은 금액: 답변에 주의 문구가 빠졌으면 코드가 덧붙임
+        low = [n for n in ((state.get("public") or {}).get("낮은 금액 주의") or []) if n in answer]
+        low_added = bool(low) and LOW_FEE_NOTE not in answer
+        if low_added:
+            answer += (f"\n\n※ 최저 수강료가 10만 원 미만인 학원({', '.join(low)})은 {LOW_FEE_NOTE}.")
+
         # 4) 범위 밖 과목이 섞여 있었으면 안내를 덧붙임 (SERVICE.md 정책 5)
         outside = state.get("outside_subjects") or []
         if outside:
@@ -751,6 +782,8 @@ def build_rag_graph():
             + (f", 근거 없음 {names['ungrounded']}" if names["ungrounded"] else "")
             + ")",
             bundle,
+            (f"낮은 금액 주의 {len(low)}곳 " + ("(답변에 없어 코드가 덧붙임)" if low_added else "(답변에 표시됨)"))
+            if low else "낮은 금액 주의 없음",
             f"범위 밖 과목 안내 덧붙임 ({'·'.join(outside)})" if outside else "범위 밖 과목 없음",
             "답변 개인정보 " + (", ".join(f"{k} {v}개 가림" for k, v in pii.items()) if pii else "없음"),
         ]
