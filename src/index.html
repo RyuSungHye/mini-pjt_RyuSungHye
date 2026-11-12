@@ -234,6 +234,14 @@ function show(data) {
   $("sourcesCard").classList.toggle("hidden", ctx.length === 0);
 }
 
+// 엔터 = 검색, Shift+엔터 = 줄바꿈. 한글 조합 중에 누른 엔터는 무시 (두 번 전송·마지막 글자 잘림 방지)
+$("q").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || e.shiftKey) return;
+  if (e.isComposing || e.keyCode === 229) return;
+  e.preventDefault();
+  $("form").requestSubmit();
+});
+
 let busy = false;
 $("form").onsubmit = async (e) => {
   e.preventDefault();

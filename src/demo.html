@@ -182,10 +182,18 @@ function show(data) {
   ["answerCard", "traceCard", "ctxCard"].forEach((id) => $(id).classList.remove("hidden"));
 }
 
+// 엔터 = 검색. 한글 조합 중에 누른 엔터는 무시 (두 번 전송·마지막 글자 잘림 방지)
+$("q").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();   // 브라우저 기본 전송은 막고 아래에서 직접 전송
+  if (e.isComposing || e.keyCode === 229) return;
+  $("form").requestSubmit();
+});
+
 $("form").onsubmit = async (e) => {
   e.preventDefault();
   const question = $("q").value.trim();
-  if (!question) return;
+  if (!question || $("btn").disabled) return;   // 빈 입력·답변 대기 중이면 무시
   $("btn").disabled = true;
   const t0 = Date.now();
   $("status").textContent = "답변을 만드는 중입니다… (20~60초 걸릴 수 있어요)";
