@@ -81,6 +81,11 @@ def _middle_fee_values(row: dict) -> list[tuple[str, int]]:
             if any(w in label for w in MIDDLE_WORDS) and amount.isdigit()]
 
 
+def _rank_fees(fee_values: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """정렬·수강료 조건 판단에 쓰는 과정. 과정명에 "특강"이 있으면 뺍니다 (목록에는 그대로 보여 줌)."""
+    return [(label, amount) for label, amount in fee_values if "특강" not in label]
+
+
 def _middle_fee(row: dict) -> str:
     fees = [f"{label} {amount:,}원" for label, amount in _middle_fee_values(row)]
     return ", ".join(fees) or "정보 없음"
@@ -126,6 +131,7 @@ def search_academies_data(dong: list[str] | str | None = None, subject: str | No
 
     sort: "fee_asc"(최저 수강료 낮은 순) / "fee_desc"(높은 순). 없으면 학원명 가나다순.
     max_fee / min_fee: 중등 수강료 조건(원). 조건 범위에 드는 중등 과정이 하나라도 있으면 통과.
+    최저 수강료·수강료 조건 판단에서 과정명에 "특강"이 있는 과정은 뺍니다 (목록 표시는 그대로).
     정렬·거르기는 조건에 맞는 학원 전체에 먼저 적용한 뒤 MAX_RESULTS개로 자릅니다.
     수강료 정보가 없는 학원은 정렬·거르기 대상에서 빼고 "수강료 정보 없음" 목록에 따로 둡니다.
     """
@@ -151,6 +157,7 @@ def search_academies_data(dong: list[str] | str | None = None, subject: str | No
         if subject and subject not in subjects:
             continue  # 과목 "정보 없음"인 학원도 여기서 빠집니다
         fee_values = _middle_fee_values(row)
+        rank_fees = _rank_fees(fee_values)  # 특강 제외
         matches.append({
             "id": row.get("학원지정번호") or row.get("학원명"),
             "학원명": row.get("학원명", ""),
@@ -159,9 +166,10 @@ def search_academies_data(dong: list[str] | str | None = None, subject: str | No
             "교습과정": f"{row.get('교습과정명', '')} ({row.get('교습과정목록명', '')})",
             "대상": _target(row),
             "수강료(중등)": _middle_fee(row),
-            # 코드로 계산한 중등 최저 수강료 (원). 정보 없으면 None
-            "_fees": fee_values,
-            "_min_fee": min(a for _, a in fee_values) if fee_values else None,
+            # 코드로 계산한 중등 최저 수강료 (원, 특강 제외). 정보 없거나 특강만 있으면 None
+            "_fees": rank_fees,
+            "_min_fee": min(a for _, a in rank_fees) if rank_fees else None,
+            "_special_only": bool(fee_values) and not rank_fees,
         })
 
     matches.sort(key=lambda m: m["학원명"])  # 기본: 가나다순. 순위가 아닙니다.
@@ -201,7 +209,8 @@ def search_academies_data(dong: list[str] | str | None = None, subject: str | No
         "전체": total,                        # 동·과목 조건에 맞는 학원 수
         "수강료 조건 통과": len(pool) if fee_mode else None,  # 정렬·거르기 대상 중 남은 수
         "결과": results,
-        "수강료 정보 없음": [m["학원명"] for m in no_fee],  # 정렬·거르기에서 빠진 학원 (맨 뒤에 따로 표시)
+        # 정렬·거르기에서 빠진 학원 (맨 뒤에 따로 표시). 특강 과정만 있는 학원도 여기에 둡니다.
+        "수강료 정보 없음": [m["학원명"] + (" (특강 과정만 있음)" if m["_special_only"] else "") for m in no_fee],
     }
 
 
