@@ -7,7 +7,8 @@
   3부    출력 가드: 단정 추천 문장 제거, 답변 속 학원 이름이 근거에 있는지 확인
   4부    학원 RAG 그래프 (가드레일 연결)
          START -> mask -> input_guard -(차단)-> END
-                               \-(통과)-> retrieve -> generate -> output_guard -> END
+                          (통과) -> scope_guard -(범위 밖 과목만)-> 범위 안내 -> END
+                          (범위 안) -> tool_call -> retrieve -> generate -> output_guard -> END
          generate는 LCEL 구조화 출력으로 답변과 근거 조각 id를 함께 받습니다.
 
 실행 (프로젝트 폴더에서)
@@ -312,6 +313,8 @@ SYSTEM_PROMPT = """당신은 성남시 분당구 중학생 학부모를 돕는 "
 규칙
 - 자료에 없는 학원, 반, 수업 시간, 교습비, 설명회 정보는 지어내지 않습니다.
 - 자료에서 확인할 수 없으면 "확인할 수 없음"이라고 말하고 학원에 직접 문의하도록 안내합니다.
+- 자료에 없는 외부 기관·사이트(나이스, 구청, 교육청 등)를 찾아보라고 안내하지 않습니다.
+- 수학·영어 외 과목은 답변에서 언급하지 않습니다. 그 과목을 안내하지 않는다는 문장도 쓰지 않습니다 (범위 안내 문구는 시스템이 답변 끝에 따로 붙입니다).
 - 자료에 "정보 없음"으로 적힌 값은 그대로 "정보 없음"이라고 답합니다.
 - 질문의 조건(동, 학년, 과목, 반 유형, 시간)에 맞는 학원·반만 답합니다.
 - 가상 학원 정보 끝에는 "(출처: 학원 소개 자료·가상)", 실제 학원 정보 끝에는 "(출처: 공공데이터·실제)"를 붙입니다.
@@ -357,6 +360,45 @@ def extract_conditions(question: str) -> dict:
     has_eng = any(w in q for w in ("영어", "잉글리시", "english"))
     subject = "수학" if has_math and not has_eng else "영어" if has_eng and not has_math else None
     return {"dong": dongs or None, "subject": subject, "source": "질문 키워드"}
+
+
+# ── 과목 범위 (SERVICE.md 정책 5): 수학·영어 외 과목은 검색 전에 코드로 판단합니다 ──
+IN_SCOPE_WORDS = {"수학": ("수학", "매스", "math"), "영어": ("영어", "잉글리시", "english")}
+# 범위 밖 과목. 다른 낱말 속에 들어간 경우는 뺍니다 (외국어·중국어의 "국어", 과학고의 "과학")
+OUT_OF_SCOPE_PATTERNS = {
+    "국어": r"(?<![외중한])국어", "과학": r"과학(?!고)", "사회": r"사회", "역사": r"역사", "한국사": r"한국사",
+    "물리": r"물리", "화학": r"화학", "생명과학": r"생명과학", "지구과학": r"지구과학", "논술": r"논술",
+    "한문": r"한문", "중국어": r"중국어", "일본어": r"일본어", "코딩": r"코딩",
+    "미술": r"미술", "음악": r"음악", "체육": r"체육",
+}
+
+
+def detect_subjects(question: str) -> tuple[list[str], list[str]]:
+    """질문 속 과목을 (범위 안, 범위 밖) 두 목록으로 나눕니다."""
+    q = question.lower()
+    inside = [s for s, words in IN_SCOPE_WORDS.items() if any(w in q for w in words)]
+    outside = [s for s, p in OUT_OF_SCOPE_PATTERNS.items() if re.search(p, question)]
+    # "생명과학"이 잡혔으면 그 안의 "과학"은 따로 세지 않습니다
+    if any(s in outside for s in ("생명과학", "지구과학")) and not re.search(r"(?<![명구])과학(?!고)", question):
+        outside = [s for s in outside if s != "과학"]
+    return inside, outside
+
+
+def scope_message(outside: list[str], question: str) -> str:
+    """범위 밖 과목만 물었을 때의 안내. 외부 기관 안내 없이 다시 묻는 방법만 알려 줍니다."""
+    dongs = [d for d in BUNDANG_DONGS if d in question]
+    dong = dongs[0] if dongs else "정자동"
+    return (f"이 서비스는 분당구 중학생 수학·영어 학원만 안내합니다. "
+            f"{'·'.join(outside)} 학원은 안내하지 않아요.\n\n"
+            f"수학이나 영어 학원을 찾으신다면 이렇게 다시 물어봐 주세요.\n"
+            f"- {dong} 중2 수학 내신대비반 있는 학원 알려줘\n"
+            f"- {dong} 중학생 영어 학원 교습비 비교해줘")
+
+
+def scope_note(outside: list[str]) -> str:
+    """범위 안 과목과 섞여 있을 때 답변 끝에 덧붙이는 안내."""
+    return (f"\n\n---\n\n> {'·'.join(outside)} 학원은 안내하지 않습니다. "
+            f"이 서비스는 분당구 중학생 수학·영어 학원만 안내합니다.")
 
 
 def _structured_answer_model():
@@ -415,7 +457,9 @@ def build_rag_graph():
         question: str          # mask 노드 이후에는 가린 질문으로 바뀝니다
         mask_counts: dict      # 그래프 밖(api.py)에서 미리 가린 항목 수. trace 기록용
         blocked: bool
-        docs: list             # [가상] 학원 소개 문서 조각
+        out_of_scope: bool     # 범위 밖 과목만 물었으면 True -> 검색·답변 모델을 부르지 않고 끝냄
+        outside_subjects: list[str]  # 질문에 나온 범위 밖 과목 (섞여 있으면 답변 끝에 안내만 덧붙임)
+        docs: list            # [가상] 학원 소개 문서 조각
         public: dict | None    # [실제] search_academies 결과. 호출하지 않았으면 None
         conditions: dict       # 동·과목 조건 (tool_call 인자 또는 질문 키워드). retrieve 필터에 씀
         answer: str
@@ -456,6 +500,23 @@ def build_rag_graph():
         update = {"blocked": blocked, "trace": state["trace"] + [step]}
         if blocked:
             update.update({"answer": BLOCK_MESSAGE, "contexts": [], "docs": []})
+        return update
+
+    # ── 입력 가드레일 3: 과목 범위 (검색 전에 코드로 판단) ────────
+    def scope_guard_node(state: RagState) -> dict:
+        inside, outside = detect_subjects(state["question"])
+        out_only = bool(outside) and not inside
+        if out_only:
+            result = f"범위 밖 과목만 질문 ({'·'.join(outside)}) -> 범위 안내로 답변, 검색·답변 모델 호출 안 함"
+        elif outside:
+            result = (f"범위 안 과목 {'·'.join(inside)}은 정상 처리, "
+                      f"범위 밖 과목 {'·'.join(outside)}은 답변 끝에 안내만 덧붙임")
+        else:
+            result = f"통과 (과목: {'·'.join(inside) or '언급 없음'})"
+        step = {"step": "scope_guard", "input": state["question"], "output": result}
+        update = {"out_of_scope": out_only, "outside_subjects": outside, "trace": state["trace"] + [step]}
+        if out_only:
+            update.update({"answer": scope_message(outside, state["question"]), "contexts": [], "docs": []})
         return update
 
     # ── [가상] 학원 소개 문서 검색 ───────────────────────────
@@ -541,7 +602,12 @@ def build_rag_graph():
         bundle = (f"묶음 표시: 가상 근거 {n_virtual}개·답변 '가상' 표시 {'O' if '가상' in answer else 'X'}, "
                   f"실제 근거 {n_public}개·답변 '실제' 표시 {'O' if '실제' in answer else 'X'}")
 
-        # 4) 답변에 개인정보가 되살아났으면 다시 가림 (SERVICE.md 정책 4)
+        # 4) 범위 밖 과목이 섞여 있었으면 안내를 덧붙임 (SERVICE.md 정책 5)
+        outside = state.get("outside_subjects") or []
+        if outside:
+            answer += scope_note(outside)
+
+        # 5) 답변에 개인정보가 되살아났으면 다시 가림 (SERVICE.md 정책 4)
         answer, pii = mask_pii_report(answer)
 
         parts = [
@@ -551,6 +617,7 @@ def build_rag_graph():
             + (f", 근거 없음 {names['ungrounded']}" if names["ungrounded"] else "")
             + ")",
             bundle,
+            f"범위 밖 과목 안내 덧붙임 ({'·'.join(outside)})" if outside else "범위 밖 과목 없음",
             "답변 개인정보 " + (", ".join(f"{k} {v}개 가림" for k, v in pii.items()) if pii else "없음"),
         ]
         step = {"step": "output_guard", "input": f"답변 {len(state['answer'])}자", "output": " / ".join(parts)}
@@ -559,13 +626,15 @@ def build_rag_graph():
     g = StateGraph(RagState)
     g.add_node("mask", mask_node)
     g.add_node("input_guard", input_guard_node)
+    g.add_node("scope_guard", scope_guard_node)
     g.add_node("retrieve", retrieve_node)
     g.add_node("tool_call", tool_call_node)
     g.add_node("generate", generate_node)
     g.add_node("output_guard", output_guard_node)
     g.add_edge(START, "mask")
     g.add_edge("mask", "input_guard")
-    g.add_conditional_edges("input_guard", lambda s: END if s["blocked"] else "tool_call", [END, "tool_call"])
+    g.add_conditional_edges("input_guard", lambda s: END if s["blocked"] else "scope_guard", [END, "scope_guard"])
+    g.add_conditional_edges("scope_guard", lambda s: END if s["out_of_scope"] else "tool_call", [END, "tool_call"])
     g.add_edge("tool_call", "retrieve")
     g.add_edge("retrieve", "generate")
     g.add_edge("generate", "output_guard")
