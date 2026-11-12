@@ -277,12 +277,14 @@ def check_academy_names(answer: str, contexts: list[dict], pool: list[dict]) -> 
 #                        |
 #                       통과
 #                        v
-#                    retrieve -> tool_call -> generate -> output_guard -> END
+#                    tool_call -> retrieve -> generate -> output_guard -> END
 #
 #   mask         : 이름·전화번호·학교 등을 가린다. 이후 노드는 가린 질문만 본다
 #   input_guard  : 프롬프트 인젝션을 막는다 (모델 호출 0회로 끝남)
-#   retrieve     : [가상] 학원 소개 문서에서 질문과 가까운 조각을 찾는다 (src/retriever.py)
 #   tool_call    : [실제] 모델이 필요하다고 판단하면 search_academies로 공공데이터를 조회한다 (src/tools.py)
+#                  여기서 정한 동·과목 조건을 retrieve가 재활용한다
+#   retrieve     : [가상] 학원 소개 문서 검색 (src/retriever.py)
+#                  ② 동·과목 필터 -> 가까운 조각 -> ① 학원 단위 확장 (반 구성까지 함께)
 #   generate     : 두 자료를 따로 받아 답한다. LCEL 구조화 출력으로 답변 + 근거 id를 받는다
 #   output_guard : 단정 추천 문장 제거, 학원 이름 근거 확인, 가상/실제 묶음 표시 확인, 답변 개인정보 재확인
 #
@@ -339,6 +341,24 @@ TOOL_SYSTEM_PROMPT = """당신은 분당구 학원 찾기 도우미의 도구 �
 - 과목은 "수학" 또는 "영어"만 넣습니다."""
 
 
+# ② 동·과목 필터용 조건. 도구를 부르지 않은 질문은 질문 속 낱말에서 직접 뽑습니다.
+BUNDANG_DONGS = ["정자동", "수내동", "서현동", "이매동", "야탑동", "구미동", "금곡동", "대장동", "판교동",
+                 "삼평동", "백현동", "운중동", "분당동", "율동", "동원동", "궁내동", "석운동", "하산운동", "도촌동"]
+PANGYO_DONGS = ["판교동", "삼평동", "백현동", "운중동"]  # "판교 쪽" = 판교 생활권
+
+
+def extract_conditions(question: str) -> dict:
+    """질문에서 동·과목을 뽑습니다. 과목이 둘 다 나오면(수학이랑 영어) 과목 조건을 걸지 않습니다."""
+    q = question.lower()
+    dongs = [d for d in BUNDANG_DONGS if d in question]
+    if not dongs and "판교" in question:
+        dongs = list(PANGYO_DONGS)
+    has_math = any(w in q for w in ("수학", "매스", "math"))
+    has_eng = any(w in q for w in ("영어", "잉글리시", "english"))
+    subject = "수학" if has_math and not has_eng else "영어" if has_eng and not has_math else None
+    return {"dong": dongs or None, "subject": subject, "source": "질문 키워드"}
+
+
 def _structured_answer_model():
     """LCEL 구조화 출력의 결과 형식. 함수 안에서 만들어 모듈을 불러올 때 외부 라이브러리를 쓰지 않습니다."""
     from pydantic import BaseModel, Field
@@ -388,8 +408,8 @@ def build_rag_graph():
     from langchain_core.prompts import ChatPromptTemplate
     from langgraph.graph import END, START, StateGraph
 
-    from src.retriever import retrieve
-    from src.tools import search_academies, search_academies_data
+    from src.retriever import retrieve_academies
+    from src.tools import normalize_dong, search_academies, search_academies_data
 
     class RagState(TypedDict, total=False):
         question: str          # mask 노드 이후에는 가린 질문으로 바뀝니다
@@ -397,6 +417,7 @@ def build_rag_graph():
         blocked: bool
         docs: list             # [가상] 학원 소개 문서 조각
         public: dict | None    # [실제] search_academies 결과. 호출하지 않았으면 None
+        conditions: dict       # 동·과목 조건 (tool_call 인자 또는 질문 키워드). retrieve 필터에 씀
         answer: str
         used_doc_ids: list[str]
         contexts: list[dict]
@@ -439,13 +460,20 @@ def build_rag_graph():
 
     # ── [가상] 학원 소개 문서 검색 ───────────────────────────
     def retrieve_node(state: RagState) -> dict:
-        docs = retrieve(state["question"])
+        # ② 동·과목 필터: tool_call이 정한 조건(없으면 질문 키워드)으로 검색 범위를 좁힙니다.
+        cond = state.get("conditions") or {}
+        # ① 학원 단위 확장: 걸린 조각의 학원은 모든 섹션(반 구성 포함)을 함께 넘깁니다.
+        res = retrieve_academies(state["question"], dongs=cond.get("dong"), subject=cond.get("subject"))
+        hits = ", ".join(f"virtual:{h.metadata['doc_id']}" for h in res["hits"])
+        flt = (f"필터: 동={cond.get('dong') or '전체'}, 과목={cond.get('subject') or '전체'} (조건 출처: {cond.get('source')})"
+               if res["filter"] else "필터 없음 (질문에 동·과목 조건 없음)")
         step = {
             "step": "retrieve",
             "input": state["question"],
-            "output": f"[가상] {len(docs)}개 조각: " + ", ".join(f"virtual:{d.metadata['doc_id']}" for d in docs),
+            "output": (f"[가상] {flt} / 검색 {len(res['hits'])}조각: {hits} "
+                       f"-> 학원 단위 확장 {len(res['academies'])}곳 {len(res['docs'])}조각: {', '.join(res['academies'])}"),
         }
-        return {"docs": docs, "trace": state.get("trace", []) + [step]}
+        return {"docs": res["docs"], "trace": state["trace"] + [step]}
 
     # ── [실제] 공공데이터 조회 도구 ──────────────────────────
     def tool_call_node(state: RagState) -> dict:
@@ -454,17 +482,24 @@ def build_rag_graph():
         if not calls:
             step = {"step": "tool_call", "input": "search_academies",
                     "output": "호출 안 함 (공공데이터 조회가 필요 없는 질문으로 판단)"}
-            return {"public": None, "trace": state["trace"] + [step]}
+            return {"public": None, "conditions": extract_conditions(state["question"]),
+                    "trace": state["trace"] + [step]}
 
         args = calls[0]["args"]  # 한 질문에 한 번만 조회합니다
         public = search_academies_data(args.get("dong"), args.get("subject"))
+        # 도구 인자를 가상 학원 검색 필터로 재활용합니다.
+        raw_dongs = args.get("dong") or []
+        raw_dongs = [raw_dongs] if isinstance(raw_dongs, str) else raw_dongs
+        conditions = {"dong": [normalize_dong(d) for d in raw_dongs] or None,
+                      "subject": args.get("subject") if args.get("subject") in ("수학", "영어") else None,
+                      "source": "tool_call 인자"}
         names = ", ".join(r["학원명"] for r in public["결과"]) or "없음"
         step = {
             "step": "tool_call",
             "input": f"search_academies({json.dumps(args, ensure_ascii=False)})",
             "output": f"[실제] 조건에 맞는 {public['전체']}곳 중 {len(public['결과'])}곳 전달 (가나다순): {names}",
         }
-        return {"public": public, "trace": state["trace"] + [step]}
+        return {"public": public, "conditions": conditions, "trace": state["trace"] + [step]}
 
     def generate_node(state: RagState) -> dict:
         result = answer_chain.invoke({
@@ -530,9 +565,9 @@ def build_rag_graph():
     g.add_node("output_guard", output_guard_node)
     g.add_edge(START, "mask")
     g.add_edge("mask", "input_guard")
-    g.add_conditional_edges("input_guard", lambda s: END if s["blocked"] else "retrieve", [END, "retrieve"])
-    g.add_edge("retrieve", "tool_call")
-    g.add_edge("tool_call", "generate")
+    g.add_conditional_edges("input_guard", lambda s: END if s["blocked"] else "tool_call", [END, "tool_call"])
+    g.add_edge("tool_call", "retrieve")
+    g.add_edge("retrieve", "generate")
     g.add_edge("generate", "output_guard")
     g.add_edge("output_guard", END)
     return g.compile()
