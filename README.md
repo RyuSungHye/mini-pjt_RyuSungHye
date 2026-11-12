@@ -52,15 +52,21 @@ POST /query {"question": ...}
    ▼  api.py: 그래프에 넣기 전에 개인정보 마스킹 (LangSmith에 원문이 남지 않게)
 ┌──────────────────────── LangGraph (src/agent.py) ────────────────────────┐
 │ mask          이름·학교·전화번호 등 마스킹 개수 기록                       │
-│ input_guard   프롬프트 인젝션이면 차단 → 안내 문구로 바로 종료             │
-│ tool_call     모델이 search_academies 호출 여부·인자(동, 과목) 결정        │
-│               └─ 공공데이터 CSV 필터 → "공공데이터(실제)" 묶음             │
+│ input_guard   프롬프트 인젝션이면 차단 ──────────────────────▶ END        │
+│ scope_guard   과목 범위 판단 (코드). 수학·영어 외 과목만 ────▶ 범위 안내 END │
+│               섞이면 그 과목 낱말을 빼고 다음 단계로                      │
+│ tool_call     search_academies 호출 여부·인자(동, 과목, 정렬, 수강료 조건)  │
+│               모델이 정하고, 동·과목이 있는데 안 부르면 코드가 호출        │
+│               └─ 공공데이터 CSV 필터 → 최저 수강료 계산·거르기·정렬        │
+│                  → 15곳 → "공공데이터(실제)" 묶음                         │
 │ retrieve      동·과목 조건(도구 인자 재활용 또는 질문 키워드)으로 필터 →   │
 │               Chroma 상위 8조각 → 걸린 학원(최대 5곳)의 5개 섹션 전부      │
 │               └─ "학원 소개 자료(가상)" 묶음                              │
 │ generate      두 묶음을 따로 넣어 LCEL 구조화 출력으로 답변 생성           │
-│ output_guard  광고성 단정 문장 제거, 학원 이름이 근거에 있는지 확인,       │
-│               두 묶음 표시 확인, 답변 재마스킹                            │
+│               (수강료 질문이면 가상 학원 반별 교습비도 코드로 정리해 넣음) │
+│ output_guard  광고성 단정 문장 제거, 학원 이름 근거 확인(1~2글자 오타는    │
+│               원본 이름으로 고침), 두 묶음 표시 확인, 10만 원 미만 주의,  │
+│               범위 밖 과목 안내 한 줄, 답변 재마스킹                      │
 └──────────────────────────────────────────────────────────────────────────┘
    │
    ▼
@@ -220,15 +226,17 @@ positive·edge 9문항(1~6, 10~12) 기준. negative·guardrail은 reference가 "
 
 | 기능 | 위치 |
 |---|---|
-| 그래프 구성 (노드·엣지) | [src/agent.py:404](src/agent.py#L404) `build_rag_graph()` |
-| 입력 가드 (인젝션 차단) | [src/agent.py:125](src/agent.py#L125) `input_guard()` |
-| 개인정보 마스킹 | [src/agent.py:184](src/agent.py#L184) `mask_pii_report()` |
-| 출력 가드 (광고 문장·학원 이름 확인) | [src/agent.py:225](src/agent.py#L225) `remove_ad_sentences()`, [src/agent.py:245](src/agent.py#L245) `check_academy_names()` |
-| 시스템 프롬프트 (두 묶음 규칙) | [src/agent.py:299](src/agent.py#L299) `SYSTEM_PROMPT` |
-| 도구 호출 판단 | [src/agent.py:333](src/agent.py#L333) `TOOL_SYSTEM_PROMPT`, [src/agent.py:479](src/agent.py#L479) `tool_call_node` |
-| 동·과목 조건 추출 | [src/agent.py:350](src/agent.py#L350) `extract_conditions()` |
-| 실행 진입점 | [src/agent.py:579](src/agent.py#L579) `run_query()` |
-| 공공데이터 검색 도구 | [src/tools.py:104](src/tools.py#L104) `search_academies_data()`, [src/tools.py:143](src/tools.py#L143) `search_academies` |
+| 그래프 구성 (노드·엣지) | [src/agent.py:609](src/agent.py#L609) `build_rag_graph()`, 연결은 [src/agent.py:836](src/agent.py#L836) |
+| 입력 가드 (인젝션 차단) | [src/agent.py:126](src/agent.py#L126) `input_guard()` |
+| 개인정보 마스킹 | [src/agent.py:185](src/agent.py#L185) `mask_pii_report()` |
+| 과목 범위 가드 (A) | [src/agent.py:669](src/agent.py#L669) `scope_guard_node`, [src/agent.py:426](src/agent.py#L426) `detect_subjects()`, [src/agent.py:451](src/agent.py#L451) `strip_out_of_scope()` |
+| 출력 가드 (광고 문장·학원 이름 확인·고치기) | [src/agent.py:779](src/agent.py#L779) `output_guard_node`, [src/agent.py:226](src/agent.py#L226) `remove_ad_sentences()`, [src/agent.py:246](src/agent.py#L246) `check_academy_names()`, [src/agent.py:287](src/agent.py#L287) `fix_academy_names()` (D) |
+| 시스템 프롬프트 (두 묶음 규칙) | [src/agent.py:334](src/agent.py#L334) `SYSTEM_PROMPT` |
+| 도구 호출 판단 (C) | [src/agent.py:380](src/agent.py#L380) `TOOL_SYSTEM_PROMPT`, [src/agent.py:708](src/agent.py#L708) `tool_call_node` |
+| 동·과목 조건 추출 | [src/agent.py:403](src/agent.py#L403) `extract_conditions()` |
+| 가상 학원 교습비 정리 (B) | [src/agent.py:549](src/agent.py#L549) `virtual_fee_summary()` |
+| 실행 진입점 | [src/agent.py:857](src/agent.py#L857) `run_query()` |
+| 공공데이터 검색 도구 (정렬·수강료 조건 B) | [src/tools.py:130](src/tools.py#L130) `search_academies_data()`, [src/tools.py:228](src/tools.py#L228) `search_academies` |
 | RAG 검색 (확장 + 필터) | [src/retriever.py:136](src/retriever.py#L136) `retrieve_academies()`, [src/retriever.py:122](src/retriever.py#L122) `build_filter()` |
 | API (경계 마스킹) | [src/api.py:56](src/api.py#L56) `query()` |
 | 고객 화면 (GET /) | [src/api.py:44](src/api.py#L44) `customer_page()`, [src/index.html](src/index.html) |
