@@ -20,7 +20,7 @@
 
 | 데이터 | 출처 | 실제/가상 |
 |---|---|---|
-| 학원교습소정보 `data/academies_seongnam.csv` | 나이스 교육정보 개방포털 (경기도교육청, 성남시 전체). **내려받은 날짜: ____년 __월 __일** | 실제 |
+| 학원교습소정보 `data/academies_seongnam.csv` | 나이스 교육정보 개방포털 (경기도교육청, 성남시 전체). **내려받은 날짜: 2026년 11월 11일** | 실제 |
 | 학원 소개 문서 10곳 `data/academy_docs/` (수학 5, 영어 5) | 직접 작성. 실존 학원과 무관 | 가상 |
 
 가상 학원과 실제 학원은 섞지 않는다. 답변은 **"학원 소개 자료(가상)"**와 **"공공데이터(실제)"** 두 묶음으로 나누고, 두 묶음을 한 표·한 순위로 합치지 않는다 (SERVICE.md 정책 2).
@@ -106,6 +106,11 @@ LANGSMITH_PROJECT=...
 
 # 4) API 서버 (http://127.0.0.1:8000, 문서: /docs)
 .venv\Scripts\uvicorn src.api:app --port 8000
+
+#    시연 화면: 브라우저에서 http://localhost:8000 접속
+#    → 질문을 입력하고 "질문하기"를 누르면 답변·처리 단계(trace)·근거(contexts)를 보여준다
+#    → 입력칸 아래 버튼은 대표 질문(test_queries.csv) 바로가기
+#    (demo.html 파일을 직접 열면 /query를 부를 수 없어 동작하지 않는다)
 
 # 5) 서버에 질문 보내기
 Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes('{"question": "중1 영어 기초부터 잡아주는 학원 있어?"}')) | ConvertTo-Json -Depth 5
@@ -205,6 +210,7 @@ positive·edge 9문항(1~6, 10~12) 기준. negative·guardrail은 reference가 "
 | 공공데이터 검색 도구 | [src/tools.py:104](src/tools.py#L104) `search_academies_data()`, [src/tools.py:143](src/tools.py#L143) `search_academies` |
 | RAG 검색 (확장 + 필터) | [src/retriever.py:136](src/retriever.py#L136) `retrieve_academies()`, [src/retriever.py:122](src/retriever.py#L122) `build_filter()` |
 | API (경계 마스킹) | [src/api.py:38](src/api.py#L38) `query()` |
+| 시연 화면 (GET /) | [src/api.py:43](src/api.py#L43) `demo_page()`, [src/demo.html](src/demo.html) |
 | 평가: 답변 생성 | [evaluation/generate_answers.py](evaluation/generate_answers.py) |
 | 평가: Judge + RAGAS | [evaluation/score_answers.py](evaluation/score_answers.py) |
 | 인-아웃 세트 | [evaluation/test_queries.csv](evaluation/test_queries.csv) |
