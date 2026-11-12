@@ -3,9 +3,11 @@
 시작 코드: Day 5 실습 SOLUTION guarded_agent.py
 
 구성
-  1~2부  입력 가드·마스킹 함수 (Day 5 그대로). 4단계 가드레일에서 그래프에 연결합니다.
-         지금(1단계)은 그래프에서 쓰지 않습니다.
-  3부    학원 RAG 그래프:  START -> retrieve -> generate -> END
+  1~2부  입력 가드·마스킹 함수 (Day 5 기반. 이름·학교 마스킹을 추가)
+  3부    출력 가드: 단정 추천 문장 제거, 답변 속 학원 이름이 근거에 있는지 확인
+  4부    학원 RAG 그래프 (가드레일 연결)
+         START -> mask -> input_guard -(차단)-> END
+                               \-(통과)-> retrieve -> generate -> output_guard -> END
          generate는 LCEL 구조화 출력으로 답변과 근거 조각 id를 함께 받습니다.
 
 실행 (프로젝트 폴더에서)
@@ -29,7 +31,7 @@ load_dotenv(ROOT / ".env")
 
 
 # ══════════════════════════════════════════════════════════════════
-# 1부. 입력 가드 (Day 5) — 4단계에서 연결 예정
+# 1부. 입력 가드 (Day 5) — 프롬프트 인젝션 차단
 # ══════════════════════════════════════════════════════════════════
 # 단어 하나로 막지 않습니다. "동작"과 "대상"이 한 문장에 함께 있을 때만 막습니다.
 #   "무시해도 되는 알람"     -> 동작(무시)만 있고 대상이 없음 -> 통과
@@ -105,7 +107,8 @@ GUARD_RULES: list[dict[str, Any]] = [
 ]
 
 # 사용자에게 보여 주는 문구. 어느 규칙에 걸렸는지 알려주지 않습니다.
-BLOCK_MESSAGE = "해당 요청은 처리할 수 없습니다. 업무 관련 질문으로 다시 요청해주세요."
+BLOCK_MESSAGE = ("해당 요청은 처리할 수 없습니다. "
+                 "분당구 중학생 수학·영어 학원 찾기와 관련된 질문(동, 학년, 과목, 반 유형 등)으로 다시 요청해 주세요.")
 
 MAX_GUARD_CHARS = 8000  # 이보다 긴 입력은 앞부분만 검사합니다 (아주 긴 입력에서도 즉시 반환)
 
@@ -148,13 +151,20 @@ def input_guard(text: str) -> tuple[bool, str]:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2부. 마스킹 (Day 5) — 4단계에서 연결 예정
+# 2부. 마스킹 (Day 5 + 이름·학교)
 # ══════════════════════════════════════════════════════════════════
 # 위에서부터 차례로 적용합니다. 순서가 중요합니다.
 #   - JWT는 긴 문자열이라 먼저 가려야 그 안의 글자가 다른 패턴에 오인되지 않습니다.
 #   - 주민번호는 전화번호보다 먼저. 뒤에 두면 전화번호 규칙이 앞부분만 잘라 먹습니다.
 #   - 치환 문자열([사번] 등)은 어떤 패턴에도 다시 걸리지 않아야 두 번 돌려도 같습니다.
 #   - 한글이 바로 붙는 경우("E123456의")가 많아서 \b 대신 앞뒤 문자를 직접 봅니다.
+
+# 이름: "우리 애 김민준이고"처럼 자녀를 가리키는 말 바로 뒤의 성+이름만 가립니다.
+# 아무 2~3글자나 가리면 "이번에" 같은 일반 단어까지 지워지므로, 앞말(자녀 표현)과 뒷말(조사)을 함께 봅니다.
+_SURNAMES = "김이박최정강조윤장임한오서신권황안송류전홍고문양손배백허유남심노하곽성차주우구민진나지엄채원천방공현함변염여추도소석선설마길연위표명기반왕금옥육인맹제모탁국어은편용예봉경"
+_CHILD_CUE = r"(?:우리|제|저희)\s*(?:애|아이|딸|아들|자녀)|(?:자녀|아이|애)\s*이름[은이]?|이름[은이]"
+_NAME_END = r"(?=\s*(?:이고|이며|이에요|예요|이야|입니다|이랑|이는|이가|이도|는|은|가|,|\.|$))"
+
 PII_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"), "[JWT]"),
     (re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}(?![0-9A-Z])"), "[AWS키]"),
@@ -163,29 +173,110 @@ PII_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\+82[-. ]?\d{1,2}[-. ]?\d{3,4}[-. ]?\d{4}(?!\d)"), "[전화번호]"),
     (re.compile(r"(?<![\d+])0\d{1,2}[-. ]?\d{3,4}[-. ]?\d{4}(?!\d)"), "[전화번호]"),
     (re.compile(r"(?<![A-Za-z0-9])E\d{6}(?!\d)"), "[사번]"),
+    # 학교: "분당○○중학교", "분당○○중 2학년" (붙여 쓴 학교 이름만. "분당구 중학생"은 건드리지 않음)
+    (re.compile(r"(?<![가-힣])[가-힣○◯OＯ]{1,10}(?:중학교|초등학교|고등학교)"), "[학교]"),
+    (re.compile(r"(?<![가-힣])[가-힣○◯OＯ]{1,10}(?:중|고|초)(?=\s*[1-6]\s*학년)"), "[학교]"),
+    # 이름: 앞말은 그대로 두고(\1) 이름 자리만 가립니다
+    (re.compile(rf"((?:{_CHILD_CUE})\s*(?:이름[은이]\s*)?)[{_SURNAMES}][가-힣]{{1,2}}{_NAME_END}"), r"\1[이름]"),
 ]
+
+
+def mask_pii_report(text: str) -> tuple[str, dict[str, int]]:
+    """마스킹한 글과, 무엇을 몇 개 가렸는지 돌려줍니다. 예: ("...", {"[이름]": 1, "[전화번호]": 1})"""
+    if not isinstance(text, str):
+        return "", {}
+    counts: dict[str, int] = {}
+    for pattern, repl in PII_PATTERNS:
+        text, n = pattern.subn(repl, text)
+        if n:
+            label = re.search(r"\[[^\]]+\]", repl).group(0)
+            counts[label] = counts.get(label, 0) + n
+    return text, counts
 
 
 def mask_pii(text: str) -> str:
     """개인정보와 자격증명을 마스킹합니다.
 
-    사번(E123456) · 전화번호 · 이메일 · AWS 액세스 키(AKIA...) · JWT(eyJ...) + 주민번호
+    사번(E123456) · 전화번호 · 이메일 · AWS 액세스 키(AKIA...) · JWT(eyJ...) · 주민번호 · 학교 · 자녀 이름
     """
-    if not isinstance(text, str):
-        return ""
-    for pattern, label in PII_PATTERNS:
-        text = pattern.sub(label, text)
-    return text
+    return mask_pii_report(text)[0]
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3부. 학원 RAG 그래프 (1단계)
+# 3부. 출력 가드
+# ══════════════════════════════════════════════════════════════════
+# SERVICE.md 정책 3: "최고", "무조건" 같은 단정적 추천을 하지 않는다.
+# 문장 안에 아래 표현이 있으면 그 문장을 지웁니다.
+# 단, "추천드리기 어렵습니다"처럼 부정하는 문장은 거절 안내이므로 남깁니다.
+AD_PHRASES = ["추천드립니다", "추천드려요", "추천합니다", "추천해요", "강력 추천", "강추",
+              "최고", "무조건", "가장 좋은", "제일 좋은", "베스트"]
+NEGATION_WORDS = ["않", "없", "어렵", "못", "드리지"]
+
+# 답변 속 학원 이름 찾기: "숲속문장영어학원", "한결노트수학교습소"처럼 붙여 쓴 이름
+ACADEMY_NAME = re.compile(r"[가-힣A-Za-z0-9]{2,}(?:학원|교습소)")
+GENERIC_NAMES = {"수학학원", "영어학원", "보습학원", "입시학원", "어학원", "수학교습소", "영어교습소"}
+
+
+def remove_ad_sentences(answer: str) -> tuple[str, list[str]]:
+    """단정 추천 표현이 든 문장을 지웁니다. (지운 뒤 답변, 지운 문장 목록)"""
+    removed: list[str] = []
+    out_lines = []
+    for line in answer.split("\n"):
+        kept = []
+        for sent in re.split(r"(?<=[.!?])\s+", line):
+            has_ad = any(p in sent for p in AD_PHRASES)
+            negated = any(w in sent for w in NEGATION_WORDS)
+            if has_ad and not negated:
+                removed.append(sent.strip())
+            else:
+                kept.append(sent)
+        new_line = " ".join(kept)
+        if line.strip() and not new_line.strip():
+            continue  # 문장이 다 지워진 줄은 빈 줄로 남기지 않습니다
+        out_lines.append(new_line)
+    return "\n".join(out_lines), removed
+
+
+def check_academy_names(answer: str, contexts: list[dict], retrieved_docs: list) -> dict:
+    """답변 속 학원 이름이 contexts에 있는지 확인합니다.
+
+    - contexts에 있음        -> ok
+    - 검색된 조각에만 있음  -> 그 조각을 contexts에 보강 (모델이 근거 id를 빠뜨린 경우)
+    - 어디에도 없음         -> ungrounded (지어냈을 수 있음)
+    """
+    names = [n for n in dict.fromkeys(ACADEMY_NAME.findall(answer)) if n not in GENERIC_NAMES]
+    ctx_text = "\n".join(c["text"] for c in contexts)
+    ok, added, ungrounded = [], [], []
+    for name in names:
+        if name in ctx_text:
+            ok.append(name)
+            continue
+        extra = [d for d in retrieved_docs if name in d.page_content]
+        if extra:
+            for d in extra:
+                if all(c["doc_id"] != d.metadata["doc_id"] for c in contexts):
+                    contexts.append({"doc_id": d.metadata["doc_id"], "text": d.page_content})
+            added.append(name)
+        else:
+            ungrounded.append(name)
+    return {"names": names, "ok": ok, "added": added, "ungrounded": ungrounded}
+
+
+# ══════════════════════════════════════════════════════════════════
+# 4부. 학원 RAG 그래프 (가드레일 연결)
 # ══════════════════════════════════════════════════════════════════
 #
-#   START -> retrieve -> generate -> END
+#   START -> mask -> input_guard --차단--> END
+#                        |
+#                       통과
+#                        v
+#                    retrieve -> generate -> output_guard -> END
 #
-#   retrieve : 학원 소개 문서에서 질문과 가까운 조각을 찾는다 (src/retriever.py)
-#   generate : 찾은 조각만 근거로 답한다. LCEL 구조화 출력으로 답변 + 근거 조각 id를 받는다
+#   mask         : 이름·전화번호·학교 등을 가린다. 이후 노드는 가린 질문만 본다
+#   input_guard  : 프롬프트 인젝션을 막는다 (모델 호출 0회로 끝남)
+#   retrieve     : 학원 소개 문서에서 질문과 가까운 조각을 찾는다 (src/retriever.py)
+#   generate     : 찾은 조각만 근거로 답한다. LCEL 구조화 출력으로 답변 + 근거 조각 id를 받는다
+#   output_guard : 단정 추천 문장 제거, 학원 이름 근거 확인, 답변 개인정보 재확인
 
 # .env의 AGENT_MODEL_ID를 씁니다. 없으면 기본값.
 MODEL_ID = os.getenv("AGENT_MODEL_ID", "global.anthropic.claude-sonnet-4-6")
@@ -202,6 +293,7 @@ SYSTEM_PROMPT = """당신은 성남시 분당구 중학생 학부모를 돕는 "
 - 질문의 조건(동, 학년, 과목, 반 유형, 시간)에 맞는 학원·반만 답합니다.
 - 학원 정보를 말할 때는 문장 끝에 "(출처: 학원 소개 자료)"를 붙입니다.
 - "최고", "무조건" 같은 단정적 추천을 하지 않고 조건별로 비교해 제시합니다.
+- 질문의 [이름], [전화번호], [학교] 같은 표시는 개인정보를 가린 것입니다. 답변에 원래 값을 추측해 쓰지 않습니다.
 - used_doc_ids에는 답변에 실제로 쓴 조각의 doc_id만 넣습니다."""
 
 HUMAN_PROMPT = """[학원 소개 자료]
@@ -227,7 +319,7 @@ def _format_context(docs) -> str:
 
 
 def build_rag_graph():
-    """retrieve -> generate 두 단계 RAG 그래프를 만듭니다."""
+    """가드레일을 두른 RAG 그래프를 만듭니다."""
     from langchain_aws import ChatBedrockConverse
     from langchain_core.prompts import ChatPromptTemplate
     from langgraph.graph import END, START, StateGraph
@@ -235,16 +327,43 @@ def build_rag_graph():
     from src.retriever import retrieve
 
     class RagState(TypedDict, total=False):
-        question: str
+        question: str          # mask 노드 이후에는 가린 질문으로 바뀝니다
+        blocked: bool
         docs: list
         answer: str
         used_doc_ids: list[str]
+        contexts: list[dict]
         trace: list[dict]
 
     llm = ChatBedrockConverse(model=MODEL_ID, region_name=REGION, temperature=0)
     prompt = ChatPromptTemplate.from_messages([("system", SYSTEM_PROMPT), ("human", HUMAN_PROMPT)])
     # LCEL: 프롬프트 | 구조화 출력 모델. 결과가 RagAnswer 객체로 나옵니다.
     answer_chain = prompt | llm.with_structured_output(_structured_answer_model())
+
+    # ── 입력 가드레일 1: 마스킹 ─────────────────────────────
+    def mask_node(state: RagState) -> dict:
+        masked, counts = mask_pii_report(state["question"])
+        detail = ", ".join(f"{k} {v}개" for k, v in counts.items()) if counts else "가릴 개인정보 없음"
+        step = {
+            "step": "mask",
+            "input": "(원문은 기록하지 않음)",
+            "output": f"{detail} -> {masked}",
+        }
+        # 같은 키로 덮어써서 이후 노드는 원문을 보지 못합니다.
+        return {"question": masked, "trace": state.get("trace", []) + [step]}
+
+    # ── 입력 가드레일 2: 인젝션 차단 ─────────────────────────
+    def input_guard_node(state: RagState) -> dict:
+        blocked, reason = input_guard(state["question"])
+        step = {
+            "step": "input_guard",
+            "input": state["question"],
+            "output": f"차단 ({reason})" if blocked else "통과",
+        }
+        update = {"blocked": blocked, "trace": state["trace"] + [step]}
+        if blocked:
+            update.update({"answer": BLOCK_MESSAGE, "contexts": [], "docs": []})
+        return update
 
     def retrieve_node(state: RagState) -> dict:
         docs = retrieve(state["question"])
@@ -271,12 +390,48 @@ def build_rag_graph():
             "trace": state["trace"] + [step],
         }
 
+    # ── 출력 가드레일 ─────────────────────────────────────
+    def output_guard_node(state: RagState) -> dict:
+        # contexts: 답변 근거로 쓴 조각. 모델이 id를 하나도 못 고르면 검색된 조각 전부를 넣습니다.
+        used = set(state.get("used_doc_ids", []))
+        docs = [d for d in state["docs"] if d.metadata["doc_id"] in used] or state["docs"]
+        contexts = [{"doc_id": d.metadata["doc_id"], "text": d.page_content} for d in docs]
+
+        # 1) 단정 추천 문장 제거 (SERVICE.md 정책 3)
+        answer, removed = remove_ad_sentences(state["answer"])
+
+        # 2) 학원 이름이 근거에 있는지 확인 (SERVICE.md 정책 1)
+        names = check_academy_names(answer, contexts, state["docs"])
+        if names["ungrounded"]:
+            answer += ("\n\n※ 다음 학원은 검색된 자료에서 확인되지 않았습니다: "
+                       + ", ".join(names["ungrounded"]) + ". 학원에 직접 확인해 주세요.")
+
+        # 3) 답변에 개인정보가 되살아났으면 다시 가림 (SERVICE.md 정책 4)
+        answer, pii = mask_pii_report(answer)
+
+        parts = [
+            f"단정 추천 문장 제거 {len(removed)}개" + (f": {removed}" if removed else ""),
+            f"학원 이름 {len(names['names'])}개 확인 (contexts에 있음 {len(names['ok'])}"
+            + (f", 검색 조각에서 근거 보강 {names['added']}" if names["added"] else "")
+            + (f", 근거 없음 {names['ungrounded']}" if names["ungrounded"] else "")
+            + ")",
+            "답변 개인정보 " + (", ".join(f"{k} {v}개 가림" for k, v in pii.items()) if pii else "없음"),
+        ]
+        step = {"step": "output_guard", "input": f"답변 {len(state['answer'])}자", "output": " / ".join(parts)}
+        return {"answer": answer, "contexts": contexts, "trace": state["trace"] + [step]}
+
     g = StateGraph(RagState)
+    g.add_node("mask", mask_node)
+    g.add_node("input_guard", input_guard_node)
     g.add_node("retrieve", retrieve_node)
     g.add_node("generate", generate_node)
-    g.add_edge(START, "retrieve")
+    g.add_node("output_guard", output_guard_node)
+    g.add_edge(START, "mask")
+    g.add_edge("mask", "input_guard")
+    g.add_conditional_edges("input_guard", lambda s: END if s["blocked"] else "retrieve", [END, "retrieve"])
     g.add_edge("retrieve", "generate")
-    g.add_edge("generate", END)
+    g.add_edge("generate", "output_guard")
+    g.add_edge("output_guard", END)
     return g.compile()
 
 
@@ -290,13 +445,7 @@ def run_query(question: str) -> dict:
         _graph = build_rag_graph()
 
     state = _graph.invoke({"question": question, "trace": []})
-
-    # contexts: 답변 근거로 쓴 조각. 모델이 id를 하나도 못 고르면 검색된 조각 전부를 넣습니다.
-    used = set(state.get("used_doc_ids", []))
-    docs = [d for d in state["docs"] if d.metadata["doc_id"] in used] or state["docs"]
-    contexts = [{"doc_id": d.metadata["doc_id"], "text": d.page_content} for d in docs]
-
-    return {"answer": state["answer"], "contexts": contexts, "trace": state["trace"]}
+    return {"answer": state["answer"], "contexts": state.get("contexts", []), "trace": state["trace"]}
 
 
 if __name__ == "__main__":
