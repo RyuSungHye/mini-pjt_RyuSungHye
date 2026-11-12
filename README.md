@@ -107,10 +107,14 @@ LANGSMITH_PROJECT=...
 # 4) API 서버 (http://127.0.0.1:8000, 문서: /docs)
 .venv\Scripts\uvicorn src.api:app --port 8000
 
-#    시연 화면: 브라우저에서 http://localhost:8000 접속
+#    고객 화면 (학부모용): 브라우저에서 http://localhost:8000/ 접속
+#    → 질문을 입력하고 "학원 찾기"를 누르면 답변과 "근거 자료 보기"(접힘)를 보여준다
+#    → 가상 학원 묶음은 보라색, 공공데이터(실제) 묶음은 초록색으로 구분. trace는 보이지 않는다
+#    → "이렇게 물어보세요" 아래 예시를 누르면 입력칸에 들어간다
+#    시연 화면 (발표·점검용): http://localhost:8000/demo 접속
 #    → 질문을 입력하고 "질문하기"를 누르면 답변·처리 단계(trace)·근거(contexts)를 보여준다
 #    → 입력칸 아래 버튼은 대표 질문(test_queries.csv) 바로가기
-#    (demo.html 파일을 직접 열면 /query를 부를 수 없어 동작하지 않는다)
+#    (index.html, demo.html 파일을 직접 열면 /query를 부를 수 없어 동작하지 않는다)
 
 # 5) 서버에 질문 보내기
 Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes('{"question": "중1 영어 기초부터 잡아주는 학원 있어?"}')) | ConvertTo-Json -Depth 5
@@ -215,8 +219,9 @@ positive·edge 9문항(1~6, 10~12) 기준. negative·guardrail은 reference가 "
 | 실행 진입점 | [src/agent.py:579](src/agent.py#L579) `run_query()` |
 | 공공데이터 검색 도구 | [src/tools.py:104](src/tools.py#L104) `search_academies_data()`, [src/tools.py:143](src/tools.py#L143) `search_academies` |
 | RAG 검색 (확장 + 필터) | [src/retriever.py:136](src/retriever.py#L136) `retrieve_academies()`, [src/retriever.py:122](src/retriever.py#L122) `build_filter()` |
-| API (경계 마스킹) | [src/api.py:38](src/api.py#L38) `query()` |
-| 시연 화면 (GET /) | [src/api.py:43](src/api.py#L43) `demo_page()`, [src/demo.html](src/demo.html) |
+| API (경계 마스킹) | [src/api.py:56](src/api.py#L56) `query()` |
+| 고객 화면 (GET /) | [src/api.py:44](src/api.py#L44) `customer_page()`, [src/index.html](src/index.html) |
+| 시연 화면 (GET /demo) | [src/api.py:50](src/api.py#L50) `demo_page()`, [src/demo.html](src/demo.html) |
 | 평가: 답변 생성 | [evaluation/generate_answers.py](evaluation/generate_answers.py) |
 | 평가: Judge + RAGAS | [evaluation/score_answers.py](evaluation/score_answers.py) |
 | 인-아웃 세트 | [evaluation/test_queries.csv](evaluation/test_queries.csv) |
